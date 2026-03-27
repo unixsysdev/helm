@@ -14,7 +14,7 @@ import math
 
 def precompute_theta_pos_frequencies(head_dim, seq_len, theta: float = 10000.0):
     head_dim -= 1
-    assert head_dim % 2 == 0, "Dimension must be divisible by 2"
+    head_dim = head_dim - (head_dim % 2)  # Round down for Lorentz time coord
     theta_numerator = torch.arange(0, head_dim, 2).float()
     theta = 1.0 / (theta ** (theta_numerator / head_dim)) # (Head_Dim / 2)
     m = torch.arange(seq_len)

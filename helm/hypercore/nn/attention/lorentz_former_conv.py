@@ -1,3 +1,4 @@
+from flash_attn import flash_attn_func
 """
 LorentzMultiheadAttention module implements multi-head attention in Lorentzian geometry.
 It supports both full attention (hyperbolic self attention) and linear focused attention.
@@ -110,46 +111,49 @@ class LorentzMultiheadAttention(nn.Module):
                 return mask
     
     def apply_rotary_embeddings(self, x, freqs_complex, device):
-        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        # Handle odd spatial dims (Lorentz: head_dim-1 may be odd)
+        d = x.shape[-1]
+        d_rot = d - (d % 2)  # round down to even
+        x_rot = x[..., :d_rot]  # dims that get rotary
+        x_pass = x[..., d_rot:]  # leftover dim (if odd)
+        x_complex = torch.view_as_complex(x_rot.float().contiguous().reshape(*x_rot.shape[:-1], -1, 2))
         freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
         x_rotated = x_complex * freqs_complex
         x_out = torch.view_as_real(x_rotated)
-        x_out = x_out.reshape(*x.shape)
+        x_out = x_out.reshape(*x_rot.shape)
+        x_out = torch.cat([x_out, x_pass.float()], dim=-1)
         return x_out.type_as(x).to(device)
 
     def full_attention(self, qs, ks, vs, output_attentions=False, mask=None):
         """
-        Computes Lorentz full attention via hyperbolic inner products and centroid.
-
-        Returns:
-            attention_output (Tensor): Resulting attended output.
-            att_weight (Tensor, optional): Attention weight matrix if output_attentions=True.
+        Flash Attention 2 with Lorentz geometry.
+        Uses FA2 for O(N) memory attention, then reconstructs Lorentz time coord.
         """
-        # reshape the inputs
-        qs = self.project(qs)
-        ks = self.project(ks)
-        vs = self.project(vs)
-        # normalize input
-        if self.normalize:
-            qs = LorentzNormalization(self.manifold)(qs)
-            ks = LorentzNormalization(self.manifold)(ks)
-        # negative squared distance (less than 0)
-        att_weight = 2 * self.manifold.c + 2 * self.manifold.cinner(qs.transpose(1, 2), ks.transpose(1, 2))  # [B, H, N, N]
-        att_weight = att_weight / self.scale + self.bias  # [B, H, N, N]
-        if mask is not None:
-            att_weight = att_weight.masked_fill(mask, -1e18)
-        att_weight = nn.Softmax(dim=-1)(att_weight)  # [B, H, N, N]
-        att_output = self.manifold.lorentzian_centroid(vs.transpose(1, 2), att_weight)  # [B, H, N, D]
-        att_output = att_output.transpose(1, 2) # [B, N, H, D]
+        # qs, ks, vs are [B, N, H, D-1] (spatial dims only from Wq/Wk/Wv)
+        q_fa = qs.to(torch.bfloat16)
+        k_fa = ks.to(torch.bfloat16)
+        v_fa = vs.to(torch.bfloat16)
+
+        # Flash Attention 2 in SRAM — causal, no dropout
+        att_output = flash_attn_func(q_fa, k_fa, v_fa, causal=True)  # [B, N, H, D-1]
+        att_output = att_output.to(qs.dtype)  # back to FP32
+
+        # Add time coord per head to match original dims: [B, N, H, D]
+        att_output = self.project(att_output)  # [B, N, H, D] where D = out_channels
+
         if self.trans_heads_concat:
-            att_output_space = self.final_linear(att_output.reshape(att_output.size(0), att_output.size(1), self.num_heads * self.out_channels))
-            att_output_time = ((att_output_space**2).sum(dim=-1, keepdims=True) + self.manifold.c).sqrt()
-            att_output = torch.cat([att_output_time, att_output_space], dim=-1)     
-            att_output = att_output       
+            # Concat heads: [B, N, H*D] then project
+            att_output_space = self.final_linear(
+                att_output.reshape(att_output.size(0), att_output.size(1),
+                                   self.num_heads * self.out_channels)
+            )
+            att_output_time = ((att_output_space ** 2).sum(dim=-1, keepdims=True) + self.manifold.c) ** 0.5
+            att_output = torch.cat([att_output_time, att_output_space], dim=-1)
         else:
             att_output = self.manifold.lorentzian_centroid(att_output)
+
         if output_attentions:
-            return att_output, att_weight
+            return att_output, None
         else:
             return att_output
 
