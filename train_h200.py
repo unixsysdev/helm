@@ -543,6 +543,10 @@ def main():
     # Save initial clean state for rollback
     nan_handler.save_clean_state(0)
 
+    # torch.compile: fuse Lorentz element-wise ops into Triton kernels
+    print("Compiling model with torch.compile (first step will take 3-5 min)...")
+    model = torch.compile(model, )
+
     while step < args.steps:
         optimizer.zero_grad()
         step_loss = 0.0
