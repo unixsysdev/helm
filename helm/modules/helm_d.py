@@ -131,6 +131,6 @@ class LTransformerDecoder(torch.nn.Module):
         decoder_features = self.ln_final(decoder_features)
 
         # shape: (batch_size, context_length, hidden_dim(width)+1)
-        logits = self.mapping(decoder_features).float()
+        logits = torch.nn.functional.linear(decoder_features.to(torch.bfloat16), self.mapping.weight.to(torch.bfloat16))
         # shape: (batch_size, context_length, vocab_size)
         return logits

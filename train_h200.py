@@ -377,12 +377,12 @@ def generate_sample(model, tokenizer, prompt, max_tokens=80, temperature=0.7, de
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--steps', type=int, default=16000)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seq_len', type=int, default=2048)
     parser.add_argument('--lr', type=float, default=6e-4)
     parser.add_argument('--warmup_steps', type=int, default=500)
     parser.add_argument('--grad_clip', type=float, default=0.5)
-    parser.add_argument('--grad_accum', type=int, default=1)
+    parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--checkpoint', type=str, default='checkpoints/helm_d_qwen3_surgery.pt')
     parser.add_argument('--resume', action='store_true', help='Auto-resume from latest checkpoint in save_dir')
     parser.add_argument('--save_dir', type=str, default='checkpoints')
@@ -543,10 +543,6 @@ def main():
     # Save initial clean state for rollback
     nan_handler.save_clean_state(0)
 
-    # torch.compile: fuse hyperbolic ops into optimized Triton kernels
-    print("Compiling model with torch.compile (first step will take 3-5 min)...")
-    model = torch.compile(model, mode="max-autotune")
-
     while step < args.steps:
         optimizer.zero_grad()
         step_loss = 0.0
@@ -575,7 +571,6 @@ def main():
                 hidden = model.ln_final(decoder_features)
 
                 # Fused: linear projection + cross-entropy in one Triton kernel
-                # The 151K logits tensor never materializes in VRAM!
                 hidden_2d = hidden.reshape(-1, hidden.size(-1))
                 loss = fused_ce_loss(hidden_2d, model.mapping.weight, targets)
                 del hidden, hidden_2d, decoder_features
