@@ -517,7 +517,7 @@ def main():
                     'loss': avg_loss,
                     'total_tokens': total_tokens,
                     'config': {
-                        'arch': 'L6W384A6',
+                        'arch': 'L16W768A12',
                         'vocab_size': vocab_size,
                         'seq_len': args.seq_len,
                         'tokenizer': 'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
