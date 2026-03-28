@@ -1,4 +1,8 @@
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
 """
 LorentzMultiheadAttention module implements multi-head attention in Lorentzian geometry.
 It supports both full attention (hyperbolic self attention) and linear focused attention.
@@ -129,13 +133,22 @@ class LorentzMultiheadAttention(nn.Module):
         Flash Attention 2 with Lorentz geometry.
         Uses FA2 for O(N) memory attention, then reconstructs Lorentz time coord.
         """
-        # qs, ks, vs are [B, N, H, D-1] (spatial dims only from Wq/Wk/Wv)
-        q_fa = qs.to(torch.bfloat16)
-        k_fa = ks.to(torch.bfloat16)
-        v_fa = vs.to(torch.bfloat16)
+        if HAS_FLASH_ATTN:
+            # Flash Attention 2 in SRAM — causal, no dropout
+            q_fa = qs.to(torch.bfloat16)
+            k_fa = ks.to(torch.bfloat16)
+            v_fa = vs.to(torch.bfloat16)
+            att_output = flash_attn_func(q_fa, k_fa, v_fa, causal=True)  # [B, N, H, D-1]
+        else:
+            # PyTorch SDPA fallback: needs [B, H, N, D] layout
+            # Use float16 (ROCm bfloat16 SDPA can segfault on some GPUs)
+            dtype = torch.float16 if qs.is_cuda else qs.dtype
+            q_sdpa = qs.to(dtype).transpose(1, 2)  # [B, H, N, D-1]
+            k_sdpa = ks.to(dtype).transpose(1, 2)
+            v_sdpa = vs.to(dtype).transpose(1, 2)
+            att_output = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True)
+            att_output = att_output.transpose(1, 2)  # back to [B, N, H, D-1]
 
-        # Flash Attention 2 in SRAM — causal, no dropout
-        att_output = flash_attn_func(q_fa, k_fa, v_fa, causal=True)  # [B, N, H, D-1]
         att_output = att_output.to(qs.dtype)  # back to FP32
 
         # Add time coord per head to match original dims: [B, N, H, D]
