@@ -1,6 +1,8 @@
 # HELM-D: H200 Optimized Hyperbolic Language Model
 
 > Fork of [Graph-and-Geometric-Learning/helm](https://github.com/Graph-and-Geometric-Learning/helm) — a hyperbolic transformer pretrained on NVIDIA H200. 130M seed → **1.37B** via Network Morphism, trained on FineWeb-Edu.
+>
+> **Checkpoints**: [datasysdev/helm-d-130m-hyperbolic](https://huggingface.co/datasysdev/helm-d-130m-hyperbolic) on HuggingFace
 
 All computations live on the [Lorentz manifold](https://en.wikipedia.org/wiki/Hyperboloid_model): $-x_0^2 + x_1^2 + \dots + x_d^2 = -1$. The model uses hyperbolic embeddings, Lorentzian attention, and Riemannian optimization — making it natively suited for hierarchical data like code ASTs, dependency trees, and taxonomy structures.
 
@@ -209,6 +211,8 @@ python -O train_h200.py --resume --save_dir /tmp/checkpoints
 |---|---|
 | `tokenizer_surgery.py` | Llama→Qwen3 embedding transfer via Lorentzian Fréchet Mean |
 | `train_h200.py` | H200 pretraining with FA2, BF16, torch.compile, NaN failsafes |
+| `train_h200_130m.py` | 130M config (L6W384A6) for continued seed training |
+| `upscale_130m_to_1b.py` | Network Morphism: 130M→1.37B (Lorentz zero-pad + layer cloning) |
 | `helm/modules/helm_d.py` | RoPE odd-dim fix, BF16 output projection |
 | `helm/hypercore/nn/attention/lorentz_former_conv.py` | Flash Attention 2 with Minkowski-compatible spatial attention |
 
