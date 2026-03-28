@@ -33,6 +33,12 @@ import signal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'helm-src'))
 
 import torch
+
+# === TF32: unlock Tensor Cores for FP32 matmuls (7x faster than CUDA cores) ===
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoTokenizer
@@ -101,7 +107,7 @@ class StreamingCoTDataset(IterableDataset):
     def _extract_text(self, example):
         """Extract text from any of the 3 dataset formats."""
         # OpenThoughts: conversations list with role/content
-        if 'conversations' in example:
+        if 'conversations' in example and example['conversations']:
             parts = []
             for turn in example['conversations']:
                 role = turn.get('role', turn.get('from', ''))
@@ -125,9 +131,13 @@ class StreamingCoTDataset(IterableDataset):
         return ''
 
     def __iter__(self):
-        """Yield seq_len chunks of token IDs continuously."""
+        """Yield seq_len chunks with shuffle buffer to prevent domain clustering."""
+        import random as _rng
+        SHUFFLE_BUFFER = 512  # accumulate chunks before shuffling
+
         mixed = self._open_streams()
-        buffer = []
+        token_buffer = []
+        chunk_buffer = []
         total_tokens = 0
 
         for example in mixed:
@@ -138,20 +148,31 @@ class StreamingCoTDataset(IterableDataset):
             if len(text) < 50:
                 continue
 
-            # Tokenize (cap individual docs to avoid memory spikes)
             ids = self.tokenizer.encode(
-                text[:16384],  # cap at 16K chars per doc
+                text[:16384],
                 add_special_tokens=False,
             )
-            buffer.extend(ids)
-            buffer.append(self.eos_id)
+            token_buffer.extend(ids)
+            token_buffer.append(self.eos_id)
             total_tokens += len(ids) + 1
 
-            # Yield complete chunks
-            while len(buffer) >= self.seq_len:
-                chunk = buffer[:self.seq_len]
-                buffer = buffer[self.seq_len:]
-                yield {'input_ids': torch.tensor(chunk, dtype=torch.long)}
+            while len(token_buffer) >= self.seq_len:
+                chunk = token_buffer[:self.seq_len]
+                token_buffer = token_buffer[self.seq_len:]
+                chunk_buffer.append(chunk)
+
+            # Shuffle and yield when buffer full
+            if len(chunk_buffer) >= SHUFFLE_BUFFER:
+                _rng.shuffle(chunk_buffer)
+                for c in chunk_buffer:
+                    yield {'input_ids': torch.tensor(c, dtype=torch.long)}
+                chunk_buffer = []
+
+        # Flush remaining
+        if chunk_buffer:
+            _rng.shuffle(chunk_buffer)
+            for c in chunk_buffer:
+                yield {'input_ids': torch.tensor(c, dtype=torch.long)}
 
 
 # ==============================================================================
@@ -230,7 +251,7 @@ def main():
     parser.add_argument('--steps', type=int, default=16000)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--seq_len', type=int, default=4096)
-    parser.add_argument('--lr', type=float, default=6e-4)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup_steps', type=int, default=500)
     parser.add_argument('--grad_clip', type=float, default=0.5)
     parser.add_argument('--grad_accum', type=int, default=8)
@@ -284,13 +305,13 @@ def main():
     print("  Streaming ready (no pre-download)")
 
     # --- Model ---
-    WIDTH = 384
+    WIDTH = 768
     print(f"\nBuilding HELM-D (vocab={vocab_size}, width={WIDTH}, ctx={args.seq_len})...")
     model = LTransformerDecoder(
         manifold_in=Lorentz(1.0),
         manifold_hidden=Lorentz(1.0),
         manifold_out=Lorentz(1.0),
-        arch="L6W384A6",
+        arch="L16W768A12",
         vocab_size=vocab_size,
         context_length=args.seq_len,
     )
@@ -318,14 +339,33 @@ def main():
 
     model = model.to(device)
 
-    # --- Optimizer ---
-    optimizer = RiemannianAdam(model.parameters(), lr=args.lr, weight_decay=0.01)
+    # --- Optimizer (dual-group: Euclidean gets decay, Manifold gets zero decay) ---
+    import geoopt
+    euclidean_params = []
+    hyperbolic_params = []
+    for name, param in model.named_parameters():
+        if isinstance(param, geoopt.ManifoldParameter):
+            hyperbolic_params.append(param)
+        else:
+            euclidean_params.append(param)
+    print(f"  Euclidean params: {sum(p.numel() for p in euclidean_params):,}")
+    print(f"  Hyperbolic params (zero decay): {sum(p.numel() for p in hyperbolic_params):,}")
+    optimizer = RiemannianAdam([
+        {"params": euclidean_params, "weight_decay": 0.01},
+        {"params": hyperbolic_params, "weight_decay": 0.0},
+    ], lr=args.lr)
     if _resume_optimizer_state:
         try:
             optimizer.load_state_dict(_resume_optimizer_state)
             print("  Optimizer state restored")
         except:
             print("  Optimizer state restore failed, using fresh")
+
+    # Force LR from args (override checkpoint LR)
+    for pg in optimizer.param_groups:
+        pg["lr"] = args.lr
+        pg["initial_lr"] = args.lr
+    print(f"  Forced optimizer LR to {args.lr}")
 
     # --- LR Scheduler ---
     def lr_schedule(step):
@@ -477,7 +517,7 @@ def main():
                     'loss': avg_loss,
                     'total_tokens': total_tokens,
                     'config': {
-                        'arch': 'L6W384A6',
+                        'arch': 'L16W768A12',
                         'vocab_size': vocab_size,
                         'seq_len': args.seq_len,
                         'tokenizer': 'TinyLlama/TinyLlama-1.1B-Chat-v1.0',

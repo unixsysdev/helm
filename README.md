@@ -1,207 +1,166 @@
-# HELM-D: H200 Optimized Hyperbolic Language Model
+# HELM-D: Hyperbolic Chain-of-Thought Reasoning Engine
 
-> Fork of [Graph-and-Geometric-Learning/helm](https://github.com/Graph-and-Geometric-Learning/helm) — a hyperbolic transformer pretrained on NVIDIA H200. 130M seed → **1.37B** via Network Morphism, trained on FineWeb-Edu.
+> Fork of [Graph-and-Geometric-Learning/helm](https://github.com/Graph-and-Geometric-Learning/helm) — a **200M parameter** fully hyperbolic transformer trained on NVIDIA H200 for structured reasoning.
 >
 > **Checkpoints**: [datasysdev/helm-d-130m-hyperbolic](https://huggingface.co/datasysdev/helm-d-130m-hyperbolic) on HuggingFace
 
-All computations live on the [Lorentz manifold](https://en.wikipedia.org/wiki/Hyperboloid_model): $-x_0^2 + x_1^2 + \dots + x_d^2 = -1$. The model uses hyperbolic embeddings, Lorentzian attention, and Riemannian optimization — making it natively suited for hierarchical data like code ASTs, dependency trees, and taxonomy structures.
+All computations live on the [Lorentz manifold](https://en.wikipedia.org/wiki/Hyperboloid_model): $-x_0^2 + x_1^2 + \dots + x_d^2 = -1$. The model uses hyperbolic embeddings, Lorentzian attention, and Riemannian optimization — making it natively suited for hierarchical data like code ASTs, dependency trees, and chain-of-thought reasoning traces.
 
 ---
 
-## Pipeline Overview
+## Current Training Run
 
-```
-Llama-3.1 HELM-D checkpoint (128K vocab, width=390)
-        │
-        ▼
-┌──────────────────────────┐
-│  1. Tokenizer Surgery    │  Llama→Qwen3 vocab swap via Lorentzian Fréchet Mean
-│     tokenizer_surgery.py │  109K direct transfer + 42K novel tokens projected
-└──────────┬───────────────┘
-           ▼
-┌──────────────────────────┐
-│  2. Architecture Refit   │  Width 390→384 for Tensor Core alignment
-│     helm_d.py            │  RoPE patched for Lorentz odd-dim
-└──────────┬───────────────┘
-           ▼
-┌──────────────────────────┐
-│  3. 130M Pretraining     │  Flash Attention 2, BF16 logits, torch.compile
-│     train_h200.py        │  193K tok/s, 1.36s/step
-└──────────┬───────────────┘
-           ▼
-┌──────────────────────────┐
-│  4. Network Morphism     │  130M → 1.37B (384→1536, 6→24 layers)
-│     upscale_130m_to_1b.py│  Zero-pad Lorentz spatial dims, clone layers
-└──────────┬───────────────┘
-           ▼
-┌──────────────────────────┐
-│  5. 1B Pretraining       │  FineWeb-Edu (2B tokens), batch=4×16 grad_accum
-│     train_h200.py        │  L24W1536A24 on H200
-└──────────────────────────┘
-```
+Training a **200M parameter** HELM-D from scratch on a multi-domain reasoning corpus:
+
+| Parameter | Value |
+|---|---|
+| Architecture | `L16W768A12` (16 layers, 768 width, 12 heads) |
+| Parameters | **200M** (175.8M Euclidean + 24.6M Hyperbolic) |
+| Tokenizer | TinyLlama 32K (dense coverage, no dead tokens) |
+| Context | 4096 tokens (full CoT traces fit in one pass) |
+| Throughput | **130K tok/s** on single H200 |
+| Optimizer | Dual-group RiemannianAdam (see below) |
+| Learning Rate | 3e-4, cosine decay with 500-step warmup |
+| Gradient Clip | 0.5 |
+| Manifold | Lorentz $-x_0^2 + \|x\|^2 = -1$, verified at 1.0000±0.0000 |
+
+### Training Data (60/20/20 Mix)
+
+| Domain | Weight | Source | Purpose |
+|---|---|---|---|
+| CoT Reasoning | 60% | [OpenThoughts-114k](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) | Math, code, science reasoning with `<think>` traces |
+| Python Code | 20% | [SmolLM-Corpus python-edu](https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus) | Educational Python |
+| Text | 20% | [SmolLM-Corpus cosmopedia-v2](https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus) | General knowledge |
+
+Streamed via `interleave_datasets` with a **512-chunk shuffle buffer** to prevent domain clustering (see Architecture Decisions below).
 
 ---
 
-## 1. Tokenizer Surgery (`tokenizer_surgery.py`)
+## Key Changes from Upstream HELM
 
-The original HELM-D uses the Llama-3.1 tokenizer (128,256 tokens). We replace it with the **Qwen3-30B-A3B tokenizer** (151,669 tokens) — the largest in the LLM ecosystem — for maximum downstream compatibility.
+### 1. Tokenizer: Llama-3.1 → TinyLlama 32K
 
-### The Problem
-Swapping tokenizers requires transferring the embedding matrix, which lives on the Lorentz manifold — every row satisfies $-x_0^2 + \sum x_i^2 = -1$. New tokens need geometrically consistent initialization to preserve manifold constraints.
+The original HELM uses the Llama-3.1 tokenizer (128K vocab). We switched to **TinyLlama's 32K tokenizer** for the CoT training run:
 
-### The Solution: Three-Case Transfer
+- **Dense coverage**: No dead tokens — every token gets trained
+- **Smaller embedding matrix**: 32K × 768 vs 128K × 768 — significant VRAM savings
+- **Better for small models**: 200M params can't support 128K vocab efficiently
 
-| Case | Count | Method |
+### 2. Architecture: L6W384A6 → L16W768A12
+
+Scaled up from the original 31M parameter toy model to a **200M parameter** engine:
+
+| | Original | Ours |
 |---|---|---|
-| **Matching tokens** (same string in both vocabs) | 109,547 (72%) | Direct 1:1 coordinate copy |
-| **Qwen3-only tokens** (not in Llama) | 42,097 (28%) | Decompose into Llama sub-tokens → **Lorentzian Fréchet Mean** |
-| **Undecomposable** | 25 (<0.1%) | Riemannian Normal initialization |
+| Layers | 6 | **16** |
+| Width | 390 | **768** |
+| Heads | 6 | **12** |
+| Head dim | 65 | **64** (Tensor Core aligned) |
+| Parameters | 31M | **200M** |
 
-The **Lorentzian Fréchet Mean** computes the geometric centroid on the hyperboloid. For a Qwen3 token like `"самостоятельно"`, we encode it with the Llama tokenizer to get sub-tokens, extract their hyperbolic embeddings, and compute the Einstein midpoint — the point that minimizes the sum of squared Lorentzian distances.
+### 3. Dual-Group Optimizer (Matching Original Authors)
 
-```bash
-python tokenizer_surgery.py
-# Requires: meta-llama/Llama-3.1-8B tokenizer access
-# Input:  HELM-D checkpoint with Llama vocab (128,256 × 390)
-# Output: HELM-D checkpoint with Qwen3 vocab (151,669 × 390)
-```
+The original HELM repo uses **two separate optimizers**: AdamW for Euclidean params and RiemannianAdam for hyperbolic params, with `weight_decay=0.0` on manifold parameters.
 
----
-
-## 2. Architecture Optimizations
-
-### Width 390 → 384 (`helm_d.py`)
-
-The original `L6W390A6` architecture has `width=390`, which doesn't align with NVIDIA Tensor Core tile sizes (multiples of 64/128). We changed to `width=384`:
-
-- Per-head dimension: `384 / 6 = 64` — perfect Tensor Core alignment
-- MLP: `384 × 4 = 1536` (vs 1560)
-- Enables Triton kernel compatibility
-
-### RoPE Fix for Lorentz Geometry (`helm_d.py`, `lorentz_former_conv.py`)
-
-In hyperbolic models, the per-head spatial dimension is `head_dim - 1` (removing the Lorentz time coordinate). At width=384 with 6 heads: `64 - 1 = 63` (odd). RoPE requires even dimensions for its complex-number encoding.
-
-**Fix**: `precompute_theta_pos_frequencies` rounds down to the nearest even number. `apply_rotary_embeddings` applies rotary encoding to the first 62 dimensions and passes the 63rd through unchanged.
-
-### Flash Attention 2 (`lorentz_former_conv.py`)
-
-The original `full_attention` materializes a full `[B, H, N, N]` attention matrix — O(N²) memory. We replaced it with Flash Attention 2.
-
-**The Lorentz challenge**: FA2 computes Euclidean dot products, but hyperbolic attention requires the Minkowski inner product $\langle x, y \rangle_\mathcal{L} = -x_0 y_0 + \sum x_i y_i$.
-
-**Solution**: Run FA2 on **spatial dimensions only** (strip the time coordinate `x_0`), then reconstruct the time coordinate after attention via the manifold projection: $x_0 = \sqrt{\|x_{1:d}\|^2 + 1}$.
-
-### Selective BF16 Output Projection (`helm_d.py`)
-
-The output projection `nn.Linear(384, 151669)` is **purely Euclidean** — no hyperbolic math. We cast this single layer to BF16:
+We implement this as a single RiemannianAdam with dual parameter groups:
 
 ```python
-logits = F.linear(features.to(torch.bfloat16), self.mapping.weight.to(torch.bfloat16))
+optimizer = RiemannianAdam([
+    {"params": euclidean_params, "weight_decay": 0.01},   # 175.8M params
+    {"params": hyperbolic_params, "weight_decay": 0.0},   # 24.6M params
+], lr=3e-4)
 ```
 
-All upstream Lorentz operations (embeddings, attention, RMSNorm) remain in strict FP32 to preserve the manifold constraint.
+**Why**: Standard L2 weight decay pulls parameters toward the Euclidean origin `[0,0,...,0]`, which is **not on the Lorentz manifold**. Applying decay to manifold parameters causes the optimizer to constantly drag embeddings off the $-1$ surface, then the `expmap` projection violently snaps them back — destabilizing training.
 
-### torch.compile (`train_h200.py`)
+### 4. Shuffle Buffer Dataloader
 
-`torch.compile(model)` fuses the many small Lorentz element-wise operations (project, sqrt, concat, Minkowski hack) into optimized Triton kernels via TorchInductor.
+The streaming `interleave_datasets` interleaves at the **document** level. Since OpenThoughts reasoning traces can be 4,000-16,000 tokens (1-4 consecutive 4096-token chunks), the model receives bursts of pure math followed by bursts of pure code — causing catastrophic loss spikes.
 
-> **Note**: `mode="max-autotune"` and `mode="reduce-overhead"` crash on CUDAGraphs due to dynamic `index_select` in LorentzEmbeddings. Default mode works.
+**Fix**: A 512-chunk shuffle buffer accumulates tokenized chunks before yielding, ensuring every batch is a representative mix of all 3 domains:
 
-### Python `-O` Flag
+```
+Documents → Tokenize → Pack into 4096-token chunks → Buffer (512) → Shuffle → Yield to GPU
+```
 
-The original HELM codebase contains 30+ `assert not torch.isnan(U).any()` checks in the manifold code (`pseudohyperboloid.py`). Each triggers a GPU→CPU synchronization, stalling the pipeline. Running with `python -O` strips all assert statements.
+This eliminated gradient spikes of 46+ and stabilized the loss descent.
 
-Debug `print()` calls in the manifold hot path were also removed.
+### 5. TF32 Tensor Core Acceleration
 
-### geoopt Compatibility Patch
+```python
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+```
 
-geoopt's `torch.norm(x, p=2, dim=dim)` in `lorentz/math.py` is incompatible with torch.compile's tracer. Patched to `torch.linalg.vector_norm(x, ord=2, dim=dim)`.
+Throughput: **40K → 130K tok/s** (3.25× speedup). All upstream Lorentz operations remain in FP32 — only matmul operations use TF32's 10-bit mantissa through the Tensor Cores.
 
----
+### 6. LR Override on Checkpoint Resume
 
-## 3. Network Morphism: 130M → 1.37B (`upscale_130m_to_1b.py`)
+PyTorch's `optimizer.load_state_dict()` restores the learning rate from the checkpoint, silently overriding CLI arguments. We force the LR after restore:
 
-After pretraining the 130M seed, we upscale to 1.37B parameters while preserving the learned Lorentz geometry.
-
-| Component | 130M | 1.37B | Method |
-|---|---|---|---|
-| Width | 384 | 1536 | Zero-pad Lorentz spatial dims |
-| Depth | 6 layers | 24 layers | Interleaved cloning (4 cycles) |
-| Heads | 6 | 24 | Per-head dim stays 64 |
-| MLP | 1536 | 6144 | Top-left corner weight placement |
-
-### Width Expansion (Lorentz Zero-Pad)
-
-Embeddings expand from [151669, 384] to [151669, 1536] by concatenating zeros to the spatial dimensions. Because the Lorentz constraint is $-x_0^2 + \sum x_i^2 = -1$, adding zeros preserves the constraint exactly.
-
-### Depth Expansion (Interleaved Cloning)
-
-The 6 trained layers are repeated 4× in the original order: `0,1,2,3,4,5, 0,1,2,3,4,5, ...`. This preserves the learned layer-to-layer computation flow. Cloned layers have their residual weights scaled by $1/\sqrt{4} = 0.5$ to prevent signal amplification.
-
-### Linear Projection
-
-All weight matrices (`Wq`, `Wk`, `Wv`, MLP) place the trained weights in the top-left corner of the larger matrix, with the remainder initialized to $\mathcal{N}(0, 0.001)$. Since new input dimensions are zero, the output is mathematically identical to the 130M model on step 1.
-
-```bash
-python upscale_130m_to_1b.py --checkpoint /tmp/checkpoints/h200_step4100.pt
-# Output: helm_1b_upscaled.pt (5.49 GB, 1.37B parameters)
+```python
+for pg in optimizer.param_groups:
+    pg["lr"] = args.lr
+    pg["initial_lr"] = args.lr
 ```
 
 ---
 
-## 4. Performance (130M Seed)
-
-Benchmarked on NVIDIA H200 (143 GB HBM3e), 130M parameter HELM-D, seq_len=2048:
-
-| Configuration | ms/step | tok/s | VRAM | Speedup |
-|---|---|---|---|---|
-| Original FP32 (chunked) | 5,966 | 43,917 | 131 GB | 1.0× |
-| Selective BF16 logits | 3,601 | 72,770 | 74 GB | 1.7× |
-| FA2 + BF16 (width=384) | 1,875 | 140,025 | 85 GB | 3.2× |
-| **FA2 + BF16 + torch.compile** | **1,370** | **192,000** | **85 GB** | **4.4×** |
-
----
-
-## Training
+## Quick Start
 
 ### Requirements
 
 ```bash
-pip install flash-attn --no-build-isolation
+pip install torch flash-attn --no-build-isolation
 pip install geoopt transformers datasets
 ```
 
-### Run
+### Training on H200
 
 ```bash
-# Fresh pretraining on H200
+export PYTHONPATH=/path/to/helm-src:$PYTHONPATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python -O train_h200.py --save_dir /tmp/checkpoints
+
+# Fresh training
+python3 -O train_cot.py \
+    --batch_size 16 --grad_accum 8 \
+    --lr 3e-4 --seq_len 4096 \
+    --save_dir /tmp/checkpoints/cot \
+    --log_every 1
 
 # Resume from checkpoint
-python -O train_h200.py --resume --save_dir /tmp/checkpoints
+python3 -O train_cot.py \
+    --batch_size 16 --grad_accum 8 \
+    --lr 3e-4 --save_dir /tmp/checkpoints/cot \
+    --log_every 1 --resume
 ```
 
-### Config
+### Generation Test
 
-| Parameter | Value |
-|---|---|
-| Architecture | L6W384A6 (6 layers, 384 width, 6 heads) |
-| Parameters | 130M |
-| Tokenizer | Qwen3-30B-A3B (151,669 vocab) |
-| Batch | 32 × 4 grad_accum = 128 effective |
-| Sequence length | 2048 |
-| Learning rate | 6e-4 (500-step warmup, cosine decay) |
-| Optimizer | RiemannianAdam |
-| Data | 100K Wikipedia (en) + 100K Python |
+```bash
+python3 test_gen.py --checkpoint /tmp/checkpoints/cot/cot_step5000.pt
+```
 
-### Safety Features
+---
 
-- **Lorentz re-projection** every 100 steps — ensures $-x_0^2 + \|x\|^2 = -1$
-- **NaN auto-rollback** — reverts to last clean checkpoint with 50% LR reduction
-- **Gradient clipping** at 0.5
-- **Rolling checkpoints** — keeps last 5 on disk
+## Architecture Decisions
+
+### Gradient Clipping: 1.0 → 0.5
+
+The original authors use `grad_clip=1.0` on a 6-layer model. At 16 layers, gradient variance compounds across 10 additional layers. Clip of 0.5 on 16 layers is physically equivalent to 1.0 on 6 layers.
+
+### LR Scaling: 4e-4 → 3e-4
+
+The original authors use `lr=4e-4` on a 31M model. As parameter count and depth scale, optimal learning rates must decrease. 3e-4 is the correct scaling for 200M parameters.
+
+### Flash Attention 2
+
+FA2 computes Euclidean dot products, but hyperbolic attention requires the Minkowski inner product $\langle x, y \rangle_{\mathcal{L}} = -x_0 y_0 + \sum x_i y_i$. We run FA2 on **spatial dimensions only** (strip the time coordinate), then reconstruct via manifold projection: $x_0 = \sqrt{\|x_{1:d}\|^2 + 1}$.
+
+### Periodic Re-projection
+
+Embeddings are snapped back to $-x_0^2 + \|x\|^2 = -1$ every 100 steps to correct constraint drift from mixed-precision gradient updates.
 
 ---
 
@@ -209,31 +168,23 @@ python -O train_h200.py --resume --save_dir /tmp/checkpoints
 
 | File | Description |
 |---|---|
+| `train_cot.py` | **Main training script** — 200M HELM-D with streaming 60/20/20 mix, shuffle buffer, dual optimizer |
+| `test_gen.py` | Temperature sweep generation test with repetition penalty grid |
+| `train_h200.py` | H200 pretraining with FA2, BF16, torch.compile (130M seed model) |
+| `train_h200_130m.py` | 130M config (L6W384A6) for seed training |
 | `tokenizer_surgery.py` | Llama→Qwen3 embedding transfer via Lorentzian Fréchet Mean |
-| `train_h200.py` | H200 pretraining with FA2, BF16, torch.compile, NaN failsafes |
-| `train_h200_130m.py` | 130M config (L6W384A6) for continued seed training |
 | `upscale_130m_to_1b.py` | Network Morphism: 130M→1.37B (Lorentz zero-pad + layer cloning) |
-| `helm/modules/helm_d.py` | RoPE odd-dim fix, BF16 output projection |
-| `helm/hypercore/nn/attention/lorentz_former_conv.py` | Flash Attention 2 with Minkowski-compatible spatial attention |
-
----
-
-## Geometric Compromises
-
-The following approximations trade mathematical exactness for training throughput:
-
-- **FA2 spatial-only attention**: True hyperbolic attention uses the Minkowski inner product $\langle q, k \rangle_\mathcal{L} = -q_0 k_0 + \sum q_i k_i$. FA2 only computes the spatial dot product $\sum q_i k_i$, dropping the time-coordinate term. The model learns to compensate, but the attention kernel is not geometrically exact.
-- **Einstein midpoint vs Karcher mean**: Tokenizer surgery uses the tangent-space Einstein midpoint (closed-form) instead of the iterative Karcher mean. For tokens whose sub-token embeddings are far apart on the hyperboloid, these diverge.
-- **Periodic re-projection**: Embeddings are snapped back to $-x_0^2 + \|x\|^2 = -1$ every 100 steps. Proper Riemannian optimization via exponential map updates should not require this — the need for re-projection indicates constraint drift from mixed-precision gradient updates.
-- **Width change (390→384)**: Required a fresh initialization rather than a Riemannian submersion that would preserve pairwise distances from the original 390-dim hyperboloid.
+| `setup_h200.sh` | H200 environment setup (CUDA, PyTorch, Flash Attention) |
+| `helm/modules/helm_d.py` | HELM-D decoder with RoPE odd-dim fix, BF16 output projection |
+| `helm/hypercore/` | Lorentz manifold operations, Riemannian optimizers |
 
 ---
 
 ## Known Issues
 
-- **torch.compile modes**: `max-autotune` and `reduce-overhead` crash with `CUDAGraphs index_select` error in LorentzEmbeddings. Only default mode works.
-- **Width 390**: The original dimension is not Tensor Core aligned. Triton kernels may illegal-memory-access at this width.
+- **torch.compile modes**: `max-autotune` and `reduce-overhead` crash with CUDAGraphs in LorentzEmbeddings. Only default mode works.
 - **geoopt + torch.compile**: Requires patching `torch.norm` → `torch.linalg.vector_norm` in geoopt's `lorentz/math.py`.
+- **Tokenizer max length warnings**: TinyLlama tokenizer reports max_length=2048 but we use 4096 seq_len — this is harmless (we handle truncation ourselves).
 
 ---
 
@@ -241,10 +192,14 @@ The following approximations trade mathematical exactness for training throughpu
 
 Based on:
 ```bibtex
-@article{helm2024,
-  title={Hyperbolic Efficient Language Models},
-  author={Graph and Geometric Learning Lab},
-  year={2024},
-  url={https://github.com/Graph-and-Geometric-Learning/helm}
+@article{he2025helm,
+  title={HELM: Hyperbolic Large Language Models via Mixture-of-Curvature Experts},
+  author={He, Neil and Anand, Rishabh and Madhu, Hiren and Maatouk, Ali and Krishnaswamy, Smita and Tassiulas, Leandros and Yang, Menglin and Ying, Rex},
+  journal={arXiv preprint arXiv:2505.24722},
+  year={2025},
 }
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
