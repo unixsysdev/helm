@@ -174,6 +174,17 @@ python -O train_h200.py --resume --save_dir /tmp/checkpoints
 
 ---
 
+## Geometric Compromises
+
+The following approximations trade mathematical exactness for training throughput:
+
+- **FA2 spatial-only attention**: True hyperbolic attention uses the Minkowski inner product $\langle q, k \rangle_\mathcal{L} = -q_0 k_0 + \sum q_i k_i$. FA2 only computes the spatial dot product $\sum q_i k_i$, dropping the time-coordinate term. The model learns to compensate, but the attention kernel is not geometrically exact.
+- **Einstein midpoint vs Karcher mean**: Tokenizer surgery uses the tangent-space Einstein midpoint (closed-form) instead of the iterative Karcher mean. For tokens whose sub-token embeddings are far apart on the hyperboloid, these diverge.
+- **Periodic re-projection**: Embeddings are snapped back to $-x_0^2 + \|x\|^2 = -1$ every 100 steps. Proper Riemannian optimization via exponential map updates should not require this — the need for re-projection indicates constraint drift from mixed-precision gradient updates.
+- **Width change (390→384)**: Required a fresh initialization rather than a Riemannian submersion that would preserve pairwise distances from the original 390-dim hyperboloid.
+
+---
+
 ## Known Issues
 
 - **torch.compile modes**: `max-autotune` and `reduce-overhead` crash with `CUDAGraphs index_select` error in LorentzEmbeddings. Only default mode works.
