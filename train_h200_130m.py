@@ -309,13 +309,13 @@ def generate_sample(model, tokenizer, prompt, max_tokens=80, temperature=0.7, de
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--steps', type=int, default=16000)
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seq_len', type=int, default=2048)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr', type=float, default=6e-4)
     parser.add_argument('--warmup_steps', type=int, default=500)
     parser.add_argument('--grad_clip', type=float, default=0.5)
-    parser.add_argument('--grad_accum', type=int, default=16)
-    parser.add_argument('--checkpoint', type=str, default='/tmp/checkpoints/helm_1b_upscaled.pt')
+    parser.add_argument('--grad_accum', type=int, default=4)  # grad_accum
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/helm_d_qwen3_surgery.pt')
     parser.add_argument('--resume', action='store_true', help='Auto-resume from latest checkpoint in save_dir')
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--save_every', type=int, default=100)
@@ -365,7 +365,7 @@ def main():
         manifold_in=Lorentz(1.0),
         manifold_hidden=Lorentz(1.0),
         manifold_out=Lorentz(1.0),
-        arch="L24W1536A24",
+        arch="L6W384A6",
         vocab_size=vocab_size,
         context_length=args.seq_len,
     )

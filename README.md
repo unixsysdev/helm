@@ -1,6 +1,6 @@
 # HELM-D: H200 Optimized Hyperbolic Language Model
 
-> Fork of [Graph-and-Geometric-Learning/helm](https://github.com/Graph-and-Geometric-Learning/helm) — a 130M hyperbolic transformer pretrained on NVIDIA H200 at 192K tokens/sec.
+> Fork of [Graph-and-Geometric-Learning/helm](https://github.com/Graph-and-Geometric-Learning/helm) — a hyperbolic transformer pretrained on NVIDIA H200. 130M seed → **1.37B** via Network Morphism, trained on FineWeb-Edu.
 
 All computations live on the [Lorentz manifold](https://en.wikipedia.org/wiki/Hyperboloid_model): $-x_0^2 + x_1^2 + \dots + x_d^2 = -1$. The model uses hyperbolic embeddings, Lorentzian attention, and Riemannian optimization — making it natively suited for hierarchical data like code ASTs, dependency trees, and taxonomy structures.
 
@@ -23,8 +23,18 @@ Llama-3.1 HELM-D checkpoint (128K vocab, width=390)
 └──────────┬───────────────┘
            ▼
 ┌──────────────────────────┐
-│  3. H200 Pretraining     │  Flash Attention 2, BF16 logits, torch.compile
-│     train_h200.py        │  192K tok/s, 1.37s/step, ~6h to 4.2B tokens
+│  3. 130M Pretraining     │  Flash Attention 2, BF16 logits, torch.compile
+│     train_h200.py        │  193K tok/s, 1.36s/step
+└──────────┬───────────────┘
+           ▼
+┌──────────────────────────┐
+│  4. Network Morphism     │  130M → 1.37B (384→1536, 6→24 layers)
+│     upscale_130m_to_1b.py│  Zero-pad Lorentz spatial dims, clone layers
+└──────────┬───────────────┘
+           ▼
+┌──────────────────────────┐
+│  5. 1B Pretraining       │  FineWeb-Edu (2B tokens), batch=4×16 grad_accum
+│     train_h200.py        │  L24W1536A24 on H200
 └──────────────────────────┘
 ```
 
@@ -108,7 +118,37 @@ geoopt's `torch.norm(x, p=2, dim=dim)` in `lorentz/math.py` is incompatible with
 
 ---
 
-## 3. Performance
+## 3. Network Morphism: 130M → 1.37B (`upscale_130m_to_1b.py`)
+
+After pretraining the 130M seed, we upscale to 1.37B parameters while preserving the learned Lorentz geometry.
+
+| Component | 130M | 1.37B | Method |
+|---|---|---|---|
+| Width | 384 | 1536 | Zero-pad Lorentz spatial dims |
+| Depth | 6 layers | 24 layers | Interleaved cloning (4 cycles) |
+| Heads | 6 | 24 | Per-head dim stays 64 |
+| MLP | 1536 | 6144 | Top-left corner weight placement |
+
+### Width Expansion (Lorentz Zero-Pad)
+
+Embeddings expand from [151669, 384] to [151669, 1536] by concatenating zeros to the spatial dimensions. Because the Lorentz constraint is $-x_0^2 + \sum x_i^2 = -1$, adding zeros preserves the constraint exactly.
+
+### Depth Expansion (Interleaved Cloning)
+
+The 6 trained layers are repeated 4× in the original order: `0,1,2,3,4,5, 0,1,2,3,4,5, ...`. This preserves the learned layer-to-layer computation flow. Cloned layers have their residual weights scaled by $1/\sqrt{4} = 0.5$ to prevent signal amplification.
+
+### Linear Projection
+
+All weight matrices (`Wq`, `Wk`, `Wv`, MLP) place the trained weights in the top-left corner of the larger matrix, with the remainder initialized to $\mathcal{N}(0, 0.001)$. Since new input dimensions are zero, the output is mathematically identical to the 130M model on step 1.
+
+```bash
+python upscale_130m_to_1b.py --checkpoint /tmp/checkpoints/h200_step4100.pt
+# Output: helm_1b_upscaled.pt (5.49 GB, 1.37B parameters)
+```
+
+---
+
+## 4. Performance (130M Seed)
 
 Benchmarked on NVIDIA H200 (143 GB HBM3e), 130M parameter HELM-D, seq_len=2048:
 
