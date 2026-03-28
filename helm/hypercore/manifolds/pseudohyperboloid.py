@@ -257,7 +257,6 @@ class PseudoHyperboloid(Manifold):
             U[positive_log_map] = self.logmap_n(x[positive_log_map], y[positive_log_map], beta, time_dim=time_dim)
             # U[positive_log_map][:,0] = y[positive_log_map][:,0]
         if True in negative_log_map:
-            print("negative_log_map")
         U[neutral] = y[neutral] - x[neutral]
         U = self.proj_tan(U, x, beta)
         return U
@@ -360,7 +359,6 @@ class PseudoHyperboloid(Manifold):
         if True in p:
             U[p] = self.ptransp_n(x[p], y[p], u[p], beta, time_dim=time_dim)
         if True in n:
-            print("pt.negative", inner_positive[n].min().item())
             negative_trans = self.ptransp_n(x[n], -y[n], u[n], beta, time_dim=time_dim)
             U[n] = self.ptransp_n(-y[n], y[n], beta, negative_trans) 
         return U

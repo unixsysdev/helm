@@ -35,7 +35,7 @@ Llama-3.1 HELM-D checkpoint (128K vocab, width=390)
 The original HELM-D uses the Llama-3.1 tokenizer (128,256 tokens). We replace it with the **Qwen3-30B-A3B tokenizer** (151,669 tokens) — the largest in the LLM ecosystem — for maximum downstream compatibility.
 
 ### The Problem
-You can't just swap tokenizers. The embedding matrix lives on the Lorentz manifold — every row satisfies $-x_0^2 + \sum x_i^2 = -1$. A naive random initialization would place new tokens at arbitrary hyperbolic distances from the trained tokens, destroying the learned geometry.
+Swapping tokenizers requires transferring the embedding matrix, which lives on the Lorentz manifold — every row satisfies $-x_0^2 + \sum x_i^2 = -1$. New tokens need geometrically consistent initialization to preserve manifold constraints.
 
 ### The Solution: Three-Case Transfer
 
@@ -96,6 +96,16 @@ All upstream Lorentz operations (embeddings, attention, RMSNorm) remain in stric
 
 > **Note**: `mode="max-autotune"` and `mode="reduce-overhead"` crash on CUDAGraphs due to dynamic `index_select` in LorentzEmbeddings. Default mode works.
 
+### Python `-O` Flag
+
+The original HELM codebase contains 30+ `assert not torch.isnan(U).any()` checks in the manifold code (`pseudohyperboloid.py`). Each triggers a GPU→CPU synchronization, stalling the pipeline. Running with `python -O` strips all assert statements.
+
+Debug `print()` calls in the manifold hot path were also removed.
+
+### geoopt Compatibility Patch
+
+geoopt's `torch.norm(x, p=2, dim=dim)` in `lorentz/math.py` is incompatible with torch.compile's tracer. Patched to `torch.linalg.vector_norm(x, ord=2, dim=dim)`.
+
 ---
 
 ## 3. Performance
@@ -125,10 +135,10 @@ pip install geoopt transformers datasets
 ```bash
 # Fresh pretraining on H200
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python train_h200.py --save_dir /tmp/checkpoints
+python -O train_h200.py --save_dir /tmp/checkpoints
 
 # Resume from checkpoint
-python train_h200.py --resume --save_dir /tmp/checkpoints
+python -O train_h200.py --resume --save_dir /tmp/checkpoints
 ```
 
 ### Config
@@ -166,9 +176,9 @@ python train_h200.py --resume --save_dir /tmp/checkpoints
 
 ## Known Issues
 
-- **Liger-Kernel**: `LigerFusedLinearCrossEntropyLoss` silently produces zero gradients at non-standard hidden dimensions. We tested at both width=390 and width=384 — the forward pass succeeds and loss appears normal, but `grad_norm ≈ 0.01` (should be 1.0-3.0). The model does not learn. **Do not use Liger with HELM.**
 - **torch.compile modes**: `max-autotune` and `reduce-overhead` crash with `CUDAGraphs index_select` error in LorentzEmbeddings. Only default mode works.
 - **Width 390**: The original dimension is not Tensor Core aligned. Triton kernels may illegal-memory-access at this width.
+- **geoopt + torch.compile**: Requires patching `torch.norm` → `torch.linalg.vector_norm` in geoopt's `lorentz/math.py`.
 
 ---
 
