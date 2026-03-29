@@ -1,6 +1,6 @@
 # H-MICE: Hierarchical Mixture of Curvature Experts
 
-A **~550M parameter** sparse transformer decoder using a **Log-Euclidean Tangent Sandwich** architecture with **curved residual stream**, **interleaved Dense/MoE blocks**, and **9 geometry-specialized experts**.
+A **~600M parameter** sparse transformer decoder using a **Log-Euclidean Tangent Sandwich** architecture with **curved residual stream**, **interleaved Dense/MoE blocks**, and **9 geometry-specialized experts**.
 
 ## Architecture
 
@@ -102,18 +102,18 @@ At Step 0: `expmap₀(logmap₀(x) + 0) = x` → perfect identity through all 16
 | Curvatures | **Fixed** k=[0.2, 0.5, 1.0, 2.0] | Prevents optimizer from collapsing manifold |
 | Spherical expert | 64D bottleneck + ε-safe projx | Avoids hollow sphere + zero-vector NaN |
 | Geometric loss | `p_selected × d²` | Backprop whip: router self-corrects |
-| Vocab | 8192 BPE (custom trained) | VRAM conserved for MoE experts |
+| Vocab | 32K (Mistral-v0.1 baseline) | Strict parameter diet |
 | Optimizer | Dual: RiemannianAdam + AdamW | ManifoldParam needs Riemannian updates |
 
 ### Sizing
 
 | Component | Params | Active/Token |
 |---|---|---|
-| Embedding (8192 × 1025, ManifoldParameter) | 8.4M | 8.4M |
-| LM Head (1024 × 8192) | 8.4M | 8.4M |
+| Embedding (32000 × 1025, ManifoldParameter) | 32.8M | 32.8M |
+| LM Head (1024 × 32000) | 32.8M | 32.8M |
 | 8 Dense Blocks (Attn + FFN + 4×RMSNorm) | ~84M | ~84M |
 | 8 MoE Blocks (Attn + 9 Experts + 4×RMSNorm) | ~490M | ~94M |
-| **Total** | **~550M** | **~195M** |
+| **Total** | **~640M** | **~244M** |
 
 ## Training: Bimodal Loss
 

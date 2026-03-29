@@ -1,25 +1,23 @@
 """
-H-MICE Tokenizer: Custom 8192-vocab BPE + Offset-Mapped Geometry Tagger
+H-MICE Tokenizer: 32K Baseline + Offset-Mapped Geometry Tagger
 
-1. Train/load a 8192-token BPE tokenizer via HuggingFace `tokenizers`
+1. Use a standard 32K tokenizer (Qwen2.5-0.5B) via HuggingFace
 2. Tag geometry via regex on raw string → project to token spans via offset_mapping
 3. No heuristics on token_ids — everything is char-span based
 
 Usage:
     from tokenizer_utils import get_tokenizer, tag_tokens
 
-    tokenizer = get_tokenizer(train_texts=corpus)  # trains if not cached
+    tokenizer = get_tokenizer()
     enc = tokenizer(text, return_offsets_mapping=True)
-    tags = tag_tokens(text, enc.offset_mapping)
+    tags = tag_tokens(text, enc['offset_mapping'])
 """
 
-import os
 import re
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
-from transformers import PreTrainedTokenizerFast
+from transformers import AutoTokenizer
 
-TOKENIZER_DIR = os.path.join(os.path.dirname(__file__), "tokenizer_8k")
-VOCAB_SIZE = 8192
+TOKENIZER_NAME = "mistralai/Mistral-7B-v0.1"
+VOCAB_SIZE = 32000  # Strict 32K diet
 
 
 # =============================================================================
@@ -117,64 +115,25 @@ def tag_tokens(text: str, offset_mapping: list) -> list:
 
 
 # =============================================================================
-# BPE Tokenizer Training / Loading
+# Tokenizer Loading
 # =============================================================================
 
-def train_tokenizer(texts: list, save_dir: str = TOKENIZER_DIR):
+_CACHED_TOKENIZER = None
+
+
+def get_tokenizer(**kwargs):
     """
-    Train a BPE tokenizer with vocab_size=8192 from a corpus of strings.
-    Saves to disk for reuse.
+    Get the 32K baseline tokenizer (Qwen2.5).
+    Supports return_offsets_mapping for geometry tagging.
     """
-    os.makedirs(save_dir, exist_ok=True)
+    global _CACHED_TOKENIZER
+    if _CACHED_TOKENIZER is not None:
+        return _CACHED_TOKENIZER
 
-    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = decoders.ByteLevel()
-
-    trainer = trainers.BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        special_tokens=["<pad>", "<unk>", "<s>", "</s>"],
-        min_frequency=2,
-        show_progress=True,
-    )
-
-    # Train from iterator
-    tokenizer.train_from_iterator(texts, trainer=trainer)
-
-    # Save raw tokenizer
-    tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
-
-    # Wrap as HuggingFace PreTrainedTokenizerFast
-    fast_tok = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        unk_token="<unk>",
-        pad_token="<pad>",
-        bos_token="<s>",
-        eos_token="</s>",
-    )
-    fast_tok.save_pretrained(save_dir)
-    print(f"  Tokenizer saved to {save_dir} (vocab={fast_tok.vocab_size})")
-    return fast_tok
-
-
-def load_tokenizer(save_dir: str = TOKENIZER_DIR):
-    """Load a previously trained tokenizer."""
-    tok = PreTrainedTokenizerFast.from_pretrained(save_dir)
+    print(f"  Loading tokenizer: {TOKENIZER_NAME}")
+    tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    _CACHED_TOKENIZER = tok
+    print(f"  Vocab: {tok.vocab_size}")
     return tok
-
-
-def get_tokenizer(train_texts: list = None, force_retrain: bool = False):
-    """
-    Get the 8192-BPE tokenizer. Trains from train_texts if not cached.
-    """
-    tok_path = os.path.join(TOKENIZER_DIR, "tokenizer.json")
-
-    if os.path.exists(tok_path) and not force_retrain:
-        print(f"  Loading cached tokenizer from {TOKENIZER_DIR}")
-        return load_tokenizer()
-
-    if train_texts is None:
-        raise ValueError("No cached tokenizer found and no train_texts provided")
-
-    print(f"  Training 8192-BPE tokenizer on {len(train_texts)} texts...")
-    return train_tokenizer(train_texts)

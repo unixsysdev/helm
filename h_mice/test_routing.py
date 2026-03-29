@@ -1,12 +1,13 @@
 """
-H-MICE v3 Validation: 8192 BPE + Offset-Mapped Tagger + Interleaved Dense/MoE
+H-MICE v3 Validation: 32K Tokenizer + Offset-Mapped Tagger + Curved Residual
 
 Verifies:
-1. Custom 8192-BPE tokenizer trains and works
-2. Offset-mapped geometry tagger produces correct tags
-3. ManifoldParameter embedding on Lorentz
-4. ~550M params, interleaved topology
-5. Router learns geometry from mock data (dual optimizer)
+1. 32K tokenizer with offset-mapped geometry tagging
+2. ManifoldParameter embedding on Lorentz
+3. Curved residual stream (tangent sandwich, all 16 layers)
+4. Zero-init identity pass-through (step 0)
+5. FA2 spatial-only attention
+6. Router learns geometry via dual optimizer
 """
 
 import torch
@@ -31,11 +32,9 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
 
-    # --- Custom Tokenizer ---
-    print("\n=== Training 8192-BPE Tokenizer ===")
-    mock_data = generate_mock_data(n_samples=10000)
-    train_texts = [s['text'] for s in mock_data]
-    tokenizer = get_tokenizer(train_texts=train_texts, force_retrain=True)
+    # --- 32K Tokenizer ---
+    print("\n=== Loading 32K Tokenizer ===")
+    tokenizer = get_tokenizer()
     V = tokenizer.vocab_size
     print(f"Vocab: {V}")
 
@@ -70,7 +69,8 @@ def main():
 
     # --- Forward Pass ---
     print("\n=== Forward Pass ===")
-    dataset = HMICEDataset(tokenizer, seq_len=512, target_tokens=10_000_000, mock_data=mock_data)
+    mock_data = generate_mock_data(n_samples=5000)
+    dataset = HMICEDataset(tokenizer, seq_len=512, target_tokens=5_000_000, mock_data=mock_data)
     loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn, num_workers=0)
     loader_iter = iter(loader)
     input_ids, geom_targets = next(loader_iter)
@@ -91,8 +91,8 @@ def main():
         try:
             input_ids, geom_targets = next(loader_iter)
         except StopIteration:
-            dataset = HMICEDataset(tokenizer, seq_len=512, target_tokens=10_000_000,
-                                   mock_data=generate_mock_data(n_samples=10000))
+            dataset = HMICEDataset(tokenizer, seq_len=512, target_tokens=5_000_000,
+                                   mock_data=generate_mock_data(n_samples=5000))
             loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn, num_workers=0)
             loader_iter = iter(loader)
             input_ids, geom_targets = next(loader_iter)

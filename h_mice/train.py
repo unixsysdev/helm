@@ -91,21 +91,19 @@ def main():
     print(f"  geom_lambda={args.geom_lambda}")
     print(f"  mock={'YES' if args.mock else 'NO'}")
 
-    # --- Data (need texts first to train tokenizer) ---
+    # --- Data ---
     from tokenizer_utils import get_tokenizer
 
     if args.mock:
         print("\nGenerating mock data for trial run...")
         mock_data = generate_mock_data(n_samples=50000)
-        train_texts = [s['text'] for s in mock_data]
     else:
         print("\nInitializing streaming 60/20/20 mix (CoT / Code / Text)...")
         mock_data = None
-        train_texts = None  # Will use cached tokenizer
 
-    # --- Tokenizer (8192 BPE) ---
-    print("\nLoading/training 8192-BPE tokenizer...")
-    tokenizer = get_tokenizer(train_texts=train_texts)
+    # --- Tokenizer (32K baseline) ---
+    print("\nLoading 32K tokenizer...")
+    tokenizer = get_tokenizer()
     vocab_size = tokenizer.vocab_size
     print(f"  Vocab: {vocab_size}")
 
