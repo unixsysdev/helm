@@ -470,10 +470,18 @@ def main():
             # Clip gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            # Guard: NaN in gradients (backward pass explosion)
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            # Guard: NaN in gradients — scan ALL parameters directly
+            has_nan_grad = torch.isnan(grad_norm) or torch.isinf(grad_norm)
+            if not has_nan_grad:
+                for p in model.parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        has_nan_grad = True
+                        break
+
+            if has_nan_grad:
                 print(f"  Step {step+1}: NaN gradient detected, purging and skipping")
                 optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
                 accum_loss = 0.0
                 accum_count = 0
                 continue
@@ -491,23 +499,25 @@ def main():
                 tok_per_s = (args.batch_size * args.grad_accum * args.seq_len * args.log_every) / elapsed
                 current_lr = scheduler.get_last_lr()[0]
 
-                # Manifold check
+                # Manifold check: Lorentz constraint should be -1.0, x₀ > 0
                 with torch.no_grad():
                     for name, param in model.named_parameters():
                         if 'embed' in name and len(param.shape) == 2 and param.shape[0] == vocab_size:
                             sample = param[:100]
                             constraint = -(sample[:, 0] ** 2) + (sample[:, 1:] ** 2).sum(dim=-1)
                             m_mean, m_std = constraint.mean().item(), constraint.std().item()
+                            x0_neg = (sample[:, 0] < 0).sum().item()
                             break
                     else:
-                        m_mean, m_std = 0.0, 0.0
+                        m_mean, m_std, x0_neg = 0.0, 0.0, 0
 
                 eta_min = (args.steps - step) * ms_per_step / 60000
+                x0_str = f" x0_neg={x0_neg}" if x0_neg > 0 else ""
                 print(
                     f"Step {step:5d}/{args.steps} | loss={avg_loss:.4f} | "
                     f"lr={current_lr:.2e} | {ms_per_step:.0f}ms/step | "
                     f"{tok_per_s:.0f} tok/s | grad={grad_norm:.2f} | "
-                    f"manifold={abs(m_mean):.4f}±{m_std:.4f} | "
+                    f"manifold={m_mean:.4f}±{m_std:.4f}{x0_str} | "
                     f"ETA {eta_min:.0f}m"
                 )
                 step_start = time.time()
