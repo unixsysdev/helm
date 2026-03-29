@@ -1,54 +1,80 @@
 # H-MICE: Hierarchical Mixture of Curvature Experts
 
-A **420M parameter** sparse transformer decoder with a **Product Manifold** (ℍ×𝔼×𝕊) and a 2-tier hierarchical router that dynamically routes tokens to geometry-specific experts.
+A **~600M parameter** sparse transformer decoder using a **Log-Euclidean Tangent Space** architecture with **interleaved Dense/MoE blocks** and **9 geometry-specialized experts**.
 
 ## Architecture
 
 ```
-Token → Embedding → [16 × Transformer Block] → LM Head → Logits
-                         │
-                    ┌────┴────┐
-                    │  Attn   │  ← Flat Euclidean tangent space
-                    ├─────────┤
-                    │ H-MICE  │  ← Mixture of Curvature Experts
-                    │  MoE    │
-                    └────┬────┘
-                         │
-          ┌──────────────┼──────────────┐
-          │              │              │
-    L1 Router (Top-1)    │              │
-          │              │              │
-    ┌─────┴─────┐   ┌───┴───┐   ┌─────┴─────┐
-    │ Hyperbolic │   │ Eucl. │   │ Spherical │
-    │ (4 exp.)   │   │(4 exp)│   │ (4 exp.)  │
-    │ Lorentz    │   │ Flat  │   │ 64D bottl.│
-    └─────┬─────┘   └───┬───┘   └─────┬─────┘
-          └──────────────┼──────────────┘
-                         │
-              expmap₀ → d² penalty → log₀
-                         │
-                   Flat residual stream
+Token → ManifoldParameter Embedding (ON Lorentz, 8192×1025)
+  │
+  logmap₀ (single projection to flat)
+  │
+  ▼  Flat Euclidean Residual Stream (1024-dim)
+  │
+  ├── Block 1  [Dense]  Attn + SwiGLU FFN (1024→2048→1024)
+  ├── Block 2  [MoE]    Attn + H-MICE Router → 9 Experts
+  ├── Block 3  [Dense]
+  ├── Block 4  [MoE]
+  ├── ...
+  ├── Block 15 [Dense]
+  └── Block 16 [MoE]
+  │
+  RMSNorm → LM Head (1024→8192) → Logits
 ```
+
+### Interleaved Block Topology
+
+| Block Type | Layers | Contents |
+|---|---|---|
+| **Dense** (odd: 1,3,5...) | 8 blocks | Attn + SwiGLU FFN (1024→2048→1024) |
+| **MoE** (even: 2,4,6...) | 8 blocks | Attn + H-MICE 2-tier Router → 9 Experts |
+
+### The 9-Expert Array (Per MoE Block)
+
+```
+L1 Router → 3 logits [Euclidean, Hyperbolic, Spherical]
+                │
+    ┌───────────┼───────────┐
+    │           │           │
+  L2 Router   L2 Router   (single)
+    │           │           │
+ ┌──┼──┐    ┌──┼──┐        │
+ E1 E2 E3 E4  H1 H2 H3 H4    S1
+ (flat)     (k=.2 .5 1 2)  (64D bottleneck)
+```
+
+| Expert | Geometry | Curvature | Operation |
+|---|---|---|---|
+| E1–E4 | Euclidean | — | Pure flat SwiGLU FFN |
+| H1 | Hyperbolic | k=0.2 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
+| H2 | Hyperbolic | k=0.5 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
+| H3 | Hyperbolic | k=1.0 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
+| H4 | Hyperbolic | k=2.0 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
+| S1 | Spherical | unit sphere | 1024→64→SwiGLU→projx→64→1024 |
 
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Residual stream | Flat Euclidean | Preserves 130k tok/s; no Lorentzian attention overhead |
-| Attention | Standard MHA + RoPE | Operates entirely in tangent space |
-| Spherical expert | 64D bottleneck | 1024D unit sphere is hollow (curse of dimensionality) |
-| Geometric loss | `p_selected × d²` | Backprop whip: router self-corrects via gradient suppression |
-| Cross-layer | log₀ back to flat | All expert outputs are flat before residual add |
-| L2 balancing | DeepSeekV3-style bias | Prevents expert collapse |
+| Embeddings | `ManifoldParameter` on Lorentz | Exponential volume for hierarchical data |
+| Entry | Single `logmap₀` at start | No NaN compounding from chained manifold ops |
+| Residual stream | Flat Euclidean | 130k tok/s throughput, numerical stability |
+| Experts | Standard `nn.Linear` SwiGLU | Stable, fast, `torch.compile` friendly |
+| Hyperbolic curvatures | **Fixed** k=[0.2, 0.5, 1.0, 2.0] | Prevents optimizer from collapsing manifold |
+| Spherical expert | 64D bottleneck | Avoids hollow sphere (curse of dimensionality) |
+| Geometric loss | `p_selected × d²` | Backprop whip: router self-corrects |
+| Vocab | 8192 BPE | VRAM conserved for MoE experts |
+| Optimizer | Dual: RiemannianAdam(emb) + AdamW(rest) | ManifoldParam needs Riemannian updates |
 
 ### Sizing
 
 | Component | Params | Active/Token |
 |---|---|---|
-| Token Embedding (32K × 1024) | 32.8M | 32.8M |
-| 16 Blocks × Attention | 67.1M | 67.1M |
-| 16 Blocks × H-MICE MoE (12 experts) | ~320M | ~20M |
-| **Total** | **~420M** | **~120M** |
+| Embedding (8192 × 1025, ManifoldParameter) | 8.4M | 8.4M |
+| LM Head (1024 × 8192) | 8.4M | 8.4M |
+| 8 Dense Blocks (Attn + FFN) | ~84M | ~84M |
+| 8 MoE Blocks (Attn + 9 Experts) | ~490M | ~94M |
+| **Total** | **~590M** | **~195M** |
 
 ## Training: Bimodal Loss
 
@@ -56,47 +82,32 @@ Token → Embedding → [16 × Transformer Block] → LM Head → Logits
 ```
 L_total = L_text + α × CrossEntropy(L1_logits, geom_targets)
 ```
-Heuristic tags force the L1 router to learn geometry assignments:
-- **Hyperbolic** (tag 2): `<think>` blocks, indented code (trees, recursion)
-- **Spherical** (tag 1): datetime, trigonometry, modular arithmetic
-- **Euclidean** (tag 0): standard prose (default)
+
+Geometry tags assigned via **offset-mapped regex projection**:
+1. Tokenize with `return_offsets_mapping=True`
+2. Regex on raw string: `<think>` blocks → Hyperbolic, datetime/trig → Spherical
+3. Project char spans to token spans via offset mapping
 
 ### Phase 2: Geometric Distortion (Steps 2001+)
 ```
-L_total = L_text + λ × Σ p_selected(x) · d_M(0, E(x))²
+L_total = L_text + λ × Σ p_selected(x) · d²_M(0, E(x))
 ```
-Router self-corrects: if a token is routed to the wrong geometry, the manifold distance explodes, `p_selected × d²` is massive, and the gradient crushes that routing probability.
+**Backprop whip**: router self-corrects via gradient from manifold distance.
 
 ## Quick Start
 
 ```bash
-# Trial run with mock data (validates router)
-python h_mice/train.py --mock --mock_steps 500
+# Trial run (validates router + manifold embedding)
+cd h_mice && python test_routing.py
 
 # Full training
 python h_mice/train.py --batch_size 16 --grad_accum 8 --lr 3e-4 \
   --save_dir /tmp/checkpoints/h_mice --seq_len 4096
 ```
 
-## Data Pipeline
-
-Streaming 60/20/20 mix:
-- **60%** OpenThoughts-114k (CoT reasoning)
-- **20%** Code (Python)
-- **20%** FineWeb-Edu (text)
-
-512-chunk shuffle buffer prevents domain clustering. Per-token geometry tags generated on-the-fly via regex heuristics.
-
 ## Safety
 
-- Triple NaN guard: forward loss → backward RuntimeError → gradient scan
-- `torch.cuda.empty_cache()` on skip to prevent OOM
-- geoopt arcosh/sqrt clamping patches
-- `_orig_mod.` prefix stripping for torch.compile checkpoints
-
-## Requirements
-
-- PyTorch 2.x with CUDA
-- geoopt
-- transformers (for tokenizer)
-- datasets (for streaming data)
+- Triple NaN guard: forward → backward → gradient scan
+- Interleaved dense blocks stabilize manifold-free residual flow
+- Fixed curvatures prevent optimizer collapse
+- `torch.cuda.empty_cache()` on OOM recovery

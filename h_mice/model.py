@@ -1,18 +1,20 @@
 """
-H-MICE: Hierarchical Mixture of Curvature Experts (400M)
+H-MICE v3: Interleaved Dense/MoE Log-Euclidean Architecture (~600M)
 
-A sparse transformer decoder with a Product Manifold (H×E×S) and a 2-tier
-hierarchical router that dynamically routes tokens to geometry-specific experts.
+ARCHITECTURE:
+  - 16 layers, interleaved:
+    - Odd blocks (1,3,5...): Dense SwiGLU FFN (1024→2048→1024)
+    - Even blocks (2,4,6...): H-MICE MoE with 9 experts
+  - 9 experts per MoE: 4 Euclidean + 4 Hyperbolic + 1 Spherical
+  - Hyperbolic curvatures: FIXED k=[0.2, 0.5, 1.0, 2.0]
+  - Spherical: 64D bottleneck (curse of dimensionality fix)
+  - Flat Euclidean residual stream (no manifold boundary crossings = no NaN)
+  - Top-1 routing across entire array
 
-Architecture:
-  - Residual stream: Flat Euclidean tangent space
-  - Attention: Standard MHA in flat space (RoPE)
-  - MoE: 3 geometries × 4 experts = 12 total, Top-1 × Top-1
-  - Expert output: manifold fold → geometric loss → log₀ back to flat
-
-Sizing:
-  - Hidden: 1024, Layers: 16, Heads: 16
-  - Total params: ~400M, Active per token: ~150M
+SIZING:
+  hidden_dim = 1024
+  intermediate_dim = 2048
+  ~600M total, ~200M active per token
 """
 
 import math
@@ -23,14 +25,14 @@ import geoopt
 
 
 # =============================================================================
-# RoPE (Rotary Position Embeddings)
+# RoPE
 # =============================================================================
 
 def precompute_rope(dim: int, max_seq: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(max_seq).float()
     freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return torch.polar(torch.ones_like(freqs), freqs)
 
 
 def apply_rope(x: torch.Tensor, freqs: torch.Tensor):
@@ -42,12 +44,10 @@ def apply_rope(x: torch.Tensor, freqs: torch.Tensor):
 
 
 # =============================================================================
-# Multi-Head Attention (Flat Euclidean Space)
+# Flat Attention
 # =============================================================================
 
 class FlatAttention(nn.Module):
-    """Standard MHA operating in flat tangent space. No manifold ops."""
-
     def __init__(self, dim: int, n_heads: int):
         super().__init__()
         self.n_heads = n_heads
@@ -57,233 +57,203 @@ class FlatAttention(nn.Module):
         self.wv = nn.Linear(dim, dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor, freqs: torch.Tensor, mask: torch.Tensor):
+    def forward(self, x, freqs, mask):
         B, T, D = x.shape
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.wv(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
         q = apply_rope(q, freqs)
         k = apply_rope(k, freqs)
-
-        # Scaled dot-product attention
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(mask is None))
-        out = out.transpose(1, 2).contiguous().view(B, T, D)
-        return self.wo(out)
+        return self.wo(out.transpose(1, 2).contiguous().view(B, T, D))
 
 
 # =============================================================================
-# Expert FFN
+# SwiGLU FFN (Dense block and Euclidean/Hyperbolic experts)
 # =============================================================================
 
-class ExpertFFN(nn.Module):
-    """Standard FFN expert: Linear → SiLU → Linear."""
-
-    def __init__(self, dim: int, hidden_dim: int):
+class SwiGLUFFN(nn.Module):
+    """SwiGLU: w2(SiLU(w1(x)) * w3(x)).  1024 → 2048 → 1024."""
+    def __init__(self, dim: int, inter_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)  # gate
+        self.w1 = nn.Linear(dim, inter_dim, bias=False)
+        self.w2 = nn.Linear(inter_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, inter_dim, bias=False)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 # =============================================================================
-# Spherical Expert (with 64D bottleneck)
+# Spherical Expert (64D bottleneck)
 # =============================================================================
 
 class SphericalExpert(nn.Module):
-    """Expert that operates in a 64D spherical subspace."""
-
-    def __init__(self, dim: int, hidden_dim: int, sphere_dim: int = 64):
+    """1024 → 64 → sphere ops → 64 → 1024."""
+    def __init__(self, dim: int, inter_dim: int, sphere_dim: int = 64):
         super().__init__()
-        self.sphere_dim = sphere_dim
         self.manifold = geoopt.manifolds.Sphere()
-
-        # Bottleneck projections
-        self.down_proj = nn.Linear(dim, sphere_dim, bias=False)
-        self.up_proj = nn.Linear(sphere_dim, dim, bias=False)
-
-        # FFN in sphere space
-        self.w1 = nn.Linear(sphere_dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, sphere_dim, bias=False)
-        self.w3 = nn.Linear(sphere_dim, hidden_dim, bias=False)
+        self.down = nn.Linear(dim, sphere_dim, bias=False)
+        self.up = nn.Linear(sphere_dim, dim, bias=False)
+        self.w1 = nn.Linear(sphere_dim, inter_dim, bias=False)
+        self.w2 = nn.Linear(inter_dim, sphere_dim, bias=False)
+        self.w3 = nn.Linear(sphere_dim, inter_dim, bias=False)
 
     def forward(self, x):
-        """Returns (flat_output, manifold_point_for_loss)."""
-        # Down-project to sphere subspace
-        x_low = self.down_proj(x)
-
-        # FFN in low-dim space
+        x_low = self.down(x)
         h = self.w2(F.silu(self.w1(x_low)) * self.w3(x_low))
-
-        # Fold onto sphere (for geometric loss)
-        h_sphere = self.manifold.projx(h)  # Project onto unit sphere
-
-        # Back to flat (log map is identity at origin for sphere → just use projected value)
-        x_low_out = h  # Return pre-projection for residual (flat)
-
-        # Up-project back to full dim
-        return self.up_proj(x_low_out), h_sphere
+        h_sphere = self.manifold.projx(h)  # For geometric loss
+        return self.up(h), h_sphere
 
 
 # =============================================================================
-# H-MICE MoE Layer
+# H-MICE MoE Layer (9 experts: 4E + 4H + 1S)
 # =============================================================================
 
 class HMICEMoE(nn.Module):
     """
-    Hierarchical Mixture of Curvature Experts.
-
-    L1: Route to geometry (Hyperbolic / Euclidean / Spherical) — Top-1
-    L2: Route to sub-expert within geometry — Top-1
-
-    All routing in flat tangent space. Manifold mapping only for loss penalty.
+    9-expert MoE with 2-tier routing.
+    L1: [Euclidean, Hyperbolic, Spherical] → Top-1
+    L2: Sub-expert within geometry → Top-1
+    
+    Fixed hyperbolic curvatures: k=[0.2, 0.5, 1.0, 2.0]
+    Geometric loss: p_selected × d² (backprop whip)
     """
+    HYP_CURVATURES = [0.2, 0.5, 1.0, 2.0]
 
-    def __init__(self, dim: int, n_experts_per_geom: int = 4, ffn_hidden: int = 768,
-                 sphere_dim: int = 64):
+    def __init__(self, dim: int, inter_dim: int):
         super().__init__()
         self.dim = dim
-        self.n_geom = 3  # H, E, S
-        self.n_experts_per_geom = n_experts_per_geom
-        hidden_dim = ffn_hidden
 
-        # Manifold instances
-        self.manifold_hyp = geoopt.manifolds.Lorentz()
-        self.manifold_sph = geoopt.manifolds.Sphere()
-        # Euclidean needs no special manifold
+        # 4 Hyperbolic manifold instances (FIXED curvatures)
+        self.hyp_manifolds = [geoopt.manifolds.Lorentz(k=k) for k in self.HYP_CURVATURES]
 
-        # L1 Geometry Router
-        self.l1_router = nn.Linear(dim, self.n_geom, bias=False)
+        # L1 Geometry Router → 3 logits
+        self.l1_router = nn.Linear(dim, 3, bias=False)
 
-        # L2 Expert Routers (one per geometry)
-        self.l2_routers = nn.ModuleList([
-            nn.Linear(dim, n_experts_per_geom, bias=False)
-            for _ in range(self.n_geom)
-        ])
+        # L2 Routers: Euclidean(4), Hyperbolic(4), Spherical(1 — no router needed)
+        self.l2_euc_router = nn.Linear(dim, 4, bias=False)
+        self.l2_hyp_router = nn.Linear(dim, 4, bias=False)
 
-        # L2 Load balancing biases (DeepSeekV3-style)
-        self.l2_biases = nn.ParameterList([
-            nn.Parameter(torch.zeros(n_experts_per_geom))
-            for _ in range(self.n_geom)
-        ])
+        # L2 Load balance biases
+        self.l2_euc_bias = nn.Parameter(torch.zeros(4))
+        self.l2_hyp_bias = nn.Parameter(torch.zeros(4))
 
-        # Experts: Hyperbolic (4) + Euclidean (4) + Spherical (4)
-        self.hyp_experts = nn.ModuleList([ExpertFFN(dim, hidden_dim) for _ in range(n_experts_per_geom)])
-        self.euc_experts = nn.ModuleList([ExpertFFN(dim, hidden_dim) for _ in range(n_experts_per_geom)])
-        self.sph_experts = nn.ModuleList([SphericalExpert(dim, hidden_dim, sphere_dim) for _ in range(n_experts_per_geom)])
+        # Experts (all standard nn.Linear)
+        self.euc_experts = nn.ModuleList([SwiGLUFFN(dim, inter_dim) for _ in range(4)])
+        self.hyp_experts = nn.ModuleList([SwiGLUFFN(dim, inter_dim) for _ in range(4)])
+        self.sph_expert = SphericalExpert(dim, inter_dim)
 
-        # Router telemetry EMA (no grad, no sync)
+        # Telemetry EMA
         self.register_buffer('l1_ema', torch.ones(3) / 3, persistent=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         """
-        Args:
-            x: [B, T, D] flat tangent space vectors
-
-        Returns:
-            output: [B, T, D] flat tangent space vectors
-            l1_logits: [B, T, 3] for supervised loss (detached for telemetry)
-            geom_loss: scalar geometric distortion penalty
+        x: [B, T, D] flat
+        Returns: output [B,T,D], l1_logits [B,T,3], geom_loss scalar
         """
         B, T, D = x.shape
-        x_flat = x.reshape(B * T, D)
+        flat = x.reshape(B * T, D)
 
-        # --- L1 Geometry Routing ---
-        l1_logits = self.l1_router(x_flat)  # [BT, 3]
-        l1_probs = F.softmax(l1_logits, dim=-1)  # [BT, 3] — MUST stay in autograd graph
-        l1_idx = l1_logits.argmax(dim=-1)   # [BT] — Top-1 hard routing
+        # L1 routing
+        l1_logits = self.l1_router(flat)  # [BT, 3]
+        l1_probs = F.softmax(l1_logits, dim=-1)
+        l1_idx = l1_logits.argmax(dim=-1)
+        p_selected = l1_probs.gather(1, l1_idx.unsqueeze(1)).squeeze(1)
 
-        # Gather p_selected for each token (stays in graph for backprop whip)
-        p_selected = l1_probs.gather(1, l1_idx.unsqueeze(1)).squeeze(1)  # [BT]
-
-        # Telemetry: update EMA (zero-sync, detached)
+        # Telemetry (zero-sync)
         with torch.no_grad():
-            l1_onehot = F.one_hot(l1_idx, self.n_geom).float()
-            l1_dist = l1_onehot.mean(dim=0)
-            self.l1_ema = 0.99 * self.l1_ema + 0.01 * l1_dist
+            self.l1_ema = 0.99 * self.l1_ema + 0.01 * F.one_hot(l1_idx, 3).float().mean(0)
 
-        # --- Dispatch to geometry groups ---
-        output = torch.zeros_like(x_flat)
+        output = torch.zeros_like(flat)
         geom_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
-        for geom_id in range(self.n_geom):
-            mask = (l1_idx == geom_id)  # [BT] boolean
-            if not mask.any():
-                continue
+        # --- Euclidean (geom_id=0) ---
+        euc_mask = (l1_idx == 0)
+        if euc_mask.any():
+            tokens = flat[euc_mask]
+            p_sel = p_selected[euc_mask]
+            l2 = (self.l2_euc_router(tokens) + self.l2_euc_bias).argmax(-1)
+            euc_out = torch.zeros_like(tokens)
+            for i in range(4):
+                m = (l2 == i)
+                if m.any():
+                    h = self.euc_experts[i](tokens[m])
+                    d_sq = h.pow(2).sum(-1)
+                    geom_loss = geom_loss + (p_sel[m] * d_sq).mean() * 0.01
+                    euc_out[m] = h
+            output[euc_mask] = euc_out
 
-            tokens = x_flat[mask]  # [N, D]
-            p_sel = p_selected[mask]  # [N] — router prob, in autograd graph
+        # --- Hyperbolic (geom_id=1) ---
+        hyp_mask = (l1_idx == 1)
+        if hyp_mask.any():
+            tokens = flat[hyp_mask]
+            p_sel = p_selected[hyp_mask]
+            l2 = (self.l2_hyp_router(tokens) + self.l2_hyp_bias).argmax(-1)
+            hyp_out = torch.zeros_like(tokens)
+            for i in range(4):
+                m = (l2 == i)
+                if m.any():
+                    h = self.hyp_experts[i](tokens[m])
+                    # Geometric fold: exp₀ to Lorentz for distance
+                    manifold = self.hyp_manifolds[i]
+                    h_tangent = F.pad(h, (1, 0), value=0.0)
+                    h_tangent = h_tangent.clamp(-10.0, 10.0)
+                    h_on_M = manifold.expmap0(h_tangent)
+                    d_sq = manifold.dist0(h_on_M).pow(2)
+                    geom_loss = geom_loss + (p_sel[m] * d_sq).mean()
+                    hyp_out[m] = h  # Output stays flat
+            output[hyp_mask] = hyp_out
 
-            # L2 routing within this geometry
-            l2_logits = self.l2_routers[geom_id](tokens) + self.l2_biases[geom_id]
-            l2_idx = l2_logits.argmax(dim=-1)  # [N]
+        # --- Spherical (geom_id=2, single expert) ---
+        sph_mask = (l1_idx == 2)
+        if sph_mask.any():
+            tokens = flat[sph_mask]
+            p_sel = p_selected[sph_mask]
+            h, h_sphere = self.sph_expert(tokens)
+            origin = torch.zeros_like(h_sphere)
+            origin[..., 0] = 1.0
+            d_sq = (1 - (h_sphere * origin).sum(-1)).pow(2)
+            geom_loss = geom_loss + (p_sel * d_sq).mean()
+            output[sph_mask] = h
 
-            # Dispatch to individual experts
-            expert_out = torch.zeros_like(tokens)
-
-            for exp_id in range(self.n_experts_per_geom):
-                exp_mask = (l2_idx == exp_id)
-                if not exp_mask.any():
-                    continue
-
-                exp_tokens = tokens[exp_mask]
-                p_exp = p_sel[exp_mask]  # Router probs for these tokens
-
-                if geom_id == 0:  # Hyperbolic
-                    h = self.hyp_experts[exp_id](exp_tokens)
-                    # Geometric fold: expmap0 to Lorentz for distance calc
-                    h_padded = F.pad(h, (1, 0), value=0.0)  # [N_exp, D+1]
-                    h_manifold = self.manifold_hyp.expmap0(h_padded)
-                    d_sq = self.manifold_hyp.dist0(h_manifold).pow(2)
-                    # CRITICAL: p_selected * d² — backprop whip to router
-                    geom_loss = geom_loss + (p_exp * d_sq).mean()
-                    expert_out[exp_mask] = h
-
-                elif geom_id == 1:  # Euclidean
-                    h = self.euc_experts[exp_id](exp_tokens)
-                    d_sq = h.pow(2).sum(dim=-1)  # L2 distance from origin
-                    geom_loss = geom_loss + (p_exp * d_sq).mean() * 0.01
-                    expert_out[exp_mask] = h
-
-                elif geom_id == 2:  # Spherical
-                    h, h_sphere = self.sph_experts[exp_id](exp_tokens)
-                    # Angular distance from north pole
-                    origin = torch.zeros_like(h_sphere)
-                    origin[..., 0] = 1.0
-                    cos_dist = (h_sphere * origin).sum(dim=-1)
-                    d_sq = (1 - cos_dist).pow(2)
-                    geom_loss = geom_loss + (p_exp * d_sq).mean()
-                    expert_out[exp_mask] = h
-
-            output[mask] = expert_out
-
-        output = output.reshape(B, T, D)
-        l1_logits_out = l1_logits.reshape(B, T, self.n_geom)
-
-        return output, l1_logits_out, geom_loss
+        return output.reshape(B, T, D), l1_logits.reshape(B, T, 3), geom_loss
 
 
 # =============================================================================
-# Transformer Block
+# Dense Block (Odd layers)
 # =============================================================================
 
-class HMICEBlock(nn.Module):
-    """Transformer block with flat attention + H-MICE MoE."""
-
-    def __init__(self, dim: int, n_heads: int, n_experts_per_geom: int = 4):
+class DenseBlock(nn.Module):
+    """Standard transformer block: Attn + SwiGLU FFN."""
+    def __init__(self, dim: int, n_heads: int, inter_dim: int):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim)
         self.attn = FlatAttention(dim, n_heads)
         self.norm2 = nn.RMSNorm(dim)
-        self.moe = HMICEMoE(dim, n_experts_per_geom)
+        self.ffn = SwiGLUFFN(dim, inter_dim)
 
     def forward(self, x, freqs, mask):
-        # Attention (flat space)
         x = x + self.attn(self.norm1(x), freqs, mask)
-        # MoE (with geometric routing)
+        x = x + self.ffn(self.norm2(x))
+        return x, None, torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+
+# =============================================================================
+# MoE Block (Even layers)
+# =============================================================================
+
+class MoEBlock(nn.Module):
+    """Transformer block with H-MICE MoE instead of FFN."""
+    def __init__(self, dim: int, n_heads: int, inter_dim: int):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(dim)
+        self.attn = FlatAttention(dim, n_heads)
+        self.norm2 = nn.RMSNorm(dim)
+        self.moe = HMICEMoE(dim, inter_dim)
+
+    def forward(self, x, freqs, mask):
+        x = x + self.attn(self.norm1(x), freqs, mask)
         moe_out, l1_logits, geom_loss = self.moe(self.norm2(x))
         x = x + moe_out
         return x, l1_logits, geom_loss
@@ -295,78 +265,93 @@ class HMICEBlock(nn.Module):
 
 class HMICETransformer(nn.Module):
     """
-    400M Hierarchical Mixture of Curvature Experts Transformer.
-
-    The residual stream operates entirely in flat Euclidean tangent space.
-    Manifold mappings act strictly as boundary layers around expert blocks.
+    ~600M Interleaved Dense/MoE Transformer.
+    
+    - Token embeddings: ManifoldParameter on Lorentz (exponential volume)  
+    - Entry: single logmap0 → flat residual stream (no NaN compounding)
+    - Odd blocks: Dense FFN. Even blocks: H-MICE MoE (9 experts).
+    - Exit: flat → lm_head (no manifold in residual = stable)
     """
-
     def __init__(self, vocab_size: int, dim: int = 1024, n_layers: int = 16,
-                 n_heads: int = 16, n_experts_per_geom: int = 4,
-                 max_seq_len: int = 4096):
+                 n_heads: int = 16, inter_dim: int = 2048, max_seq_len: int = 4096):
         super().__init__()
         self.dim = dim
         self.n_layers = n_layers
         self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
 
-        # Token embedding (flat space)
-        self.tok_emb = nn.Embedding(vocab_size, dim)
-        nn.init.normal_(self.tok_emb.weight, std=0.02)
+        # Main manifold for embeddings
+        self.manifold = geoopt.manifolds.Lorentz(k=1.0)
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            HMICEBlock(dim, n_heads, n_experts_per_geom)
-            for _ in range(n_layers)
-        ])
+        # Token embedding ON the Lorentz manifold (dim+1 for time component)
+        emb_weights = self._init_lorentz_embeddings(vocab_size, dim)
+        self.tok_emb = geoopt.ManifoldParameter(emb_weights, manifold=self.manifold)
 
-        # Output
+        # Interleaved: even idx=Dense, odd idx=MoE
+        self.blocks = nn.ModuleList()
+        for i in range(n_layers):
+            if i % 2 == 0:
+                self.blocks.append(DenseBlock(dim, n_heads, inter_dim))
+            else:
+                self.blocks.append(MoEBlock(dim, n_heads, inter_dim))
+
         self.norm_out = nn.RMSNorm(dim)
+        # LM head: flat dim → vocab (NOT tied, shapes differ: emb is D+1, head is D)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
-        # Tie weights
-        self.lm_head.weight = self.tok_emb.weight
-
-        # RoPE frequencies
         self.register_buffer('freqs', precompute_rope(dim // n_heads, max_seq_len))
+        cmask = torch.triu(torch.full((max_seq_len, max_seq_len), float('-inf')), diagonal=1)
+        self.register_buffer('causal_mask', cmask)
 
-        # Causal mask
-        mask = torch.triu(torch.full((max_seq_len, max_seq_len), float('-inf')), diagonal=1)
-        self.register_buffer('causal_mask', mask)
+    def _init_lorentz_embeddings(self, vocab_size, dim):
+        """Initialize embeddings as points on the Lorentz manifold."""
+        spatial = torch.randn(vocab_size, dim) * 0.01
+        time = (1.0 + (spatial ** 2).sum(dim=-1, keepdim=True)).sqrt()
+        return torch.cat([time, spatial], dim=-1)  # [V, D+1]
 
-    def forward(self, input_ids: torch.Tensor):
-        """
-        Args:
-            input_ids: [B, T] token indices
-
-        Returns:
-            logits: [B, T, V]
-            all_l1_logits: [B, T, 3] from last layer (for supervised loss)
-            total_geom_loss: scalar
-        """
+    def forward(self, input_ids):
         B, T = input_ids.shape
-        x = self.tok_emb(input_ids)
+
+        # Embedding lookup → on manifold [B, T, D+1]
+        x_manifold = self.tok_emb[input_ids]
+
+        # Single logmap0 → flat residual stream [B, T, D] (spatial only)
+        v = self.manifold.logmap0(x_manifold)
+        x = v[..., 1:]  # Drop time component → flat D-dim
 
         mask = self.causal_mask[:T, :T]
-        total_geom_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        last_l1_logits = None
+        total_geom = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        last_l1 = None
+        n_moe = 0
 
         for block in self.blocks:
-            x, l1_logits, geom_loss = block(x, self.freqs, mask)
-            total_geom_loss = total_geom_loss + geom_loss
-            last_l1_logits = l1_logits
+            x, l1, gl = block(x, self.freqs, mask)
+            if l1 is not None:
+                last_l1 = l1
+                total_geom = total_geom + gl
+                n_moe += 1
 
         x = self.norm_out(x)
         logits = self.lm_head(x)
-
-        return logits, last_l1_logits, total_geom_loss / self.n_layers
+        avg_geom = total_geom / max(n_moe, 1)
+        return logits, last_l1, avg_geom
 
     def count_params(self):
-        total = sum(p.numel() for p in self.parameters())
-        unique = total - self.tok_emb.weight.numel()  # tied weights
-        return total, unique
+        return sum(p.numel() for p in self.parameters())
+
+    def get_hyperbolic_params(self):
+        """ManifoldParameter only — for RiemannianAdam (zero weight decay)."""
+        return [p for p in self.parameters() if isinstance(p, geoopt.ManifoldParameter)]
+
+    def get_euclidean_params(self):
+        """All standard params — for AdamW (0.1 weight decay)."""
+        return [p for p in self.parameters() if not isinstance(p, geoopt.ManifoldParameter)]
 
     def get_l1_distribution(self):
-        """Get averaged L1 routing EMA across all layers."""
-        emas = torch.stack([b.moe.l1_ema for b in self.blocks])
-        return emas.mean(dim=0)
+        emas = []
+        for b in self.blocks:
+            if hasattr(b, 'moe'):
+                emas.append(b.moe.l1_ema)
+        if emas:
+            return torch.stack(emas).mean(0)
+        return torch.ones(3) / 3
+

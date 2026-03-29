@@ -11,6 +11,7 @@ Features:
 
 import os
 import time
+import geoopt
 import argparse
 import torch
 import torch.nn.functional as F
@@ -119,16 +120,16 @@ def main():
     print("  Data ready")
 
     # --- Model ---
-    print(f"\nBuilding H-MICE (vocab={vocab_size}, dim=1024, layers=16, heads=16)...")
+    print(f"\nBuilding H-MICE v3 (vocab={vocab_size}, dim=1024, inter=2048, layers=16)...")
     model = HMICETransformer(
         vocab_size=vocab_size,
         dim=1024,
         n_layers=16,
         n_heads=16,
-        n_experts_per_geom=4,
+        inter_dim=2048,
         max_seq_len=args.seq_len,
     )
-    total_params, unique_params = model.count_params()
+    total_params = model.count_params()
     print(f"  Total parameters: {total_params:,} ({total_params/1e6:.0f}M)")
 
     # --- Resume ---
@@ -149,33 +150,44 @@ def main():
 
     model = model.to(device)
 
-    # --- Optimizer ---
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                                  weight_decay=0.1, fused=True)
+    # --- Dual Optimizer ---
+    hyp_params = model.get_hyperbolic_params()
+    euc_params = model.get_euclidean_params()
+    print(f"  Hyperbolic params (ManifoldParameter): {sum(p.numel() for p in hyp_params):,}")
+    print(f"  Euclidean params: {sum(p.numel() for p in euc_params):,}")
+
+    # RiemannianAdam for ManifoldParameter (embeddings on Lorentz)
+    opt_hyp = geoopt.optim.RiemannianAdam(hyp_params, lr=args.lr, weight_decay=0.0)
+    # AdamW for everything else
+    opt_euc = torch.optim.AdamW(euc_params, lr=args.lr, betas=(0.9, 0.95),
+                                 weight_decay=0.1, fused=True)
+    print(f"  RiemannianAdam (hyp, wd=0) + AdamW (euc, wd=0.1)")
 
     if _resume_optimizer_state:
         try:
-            for state in _resume_optimizer_state['state'].values():
-                if 'step' not in state:
-                    state['step'] = torch.tensor(float(start_step))
-            optimizer.load_state_dict(_resume_optimizer_state)
-            print("  Optimizer state restored (with momentum)")
+            if 'opt_hyp' in _resume_optimizer_state:
+                opt_hyp.load_state_dict(_resume_optimizer_state['opt_hyp'])
+                opt_euc.load_state_dict(_resume_optimizer_state['opt_euc'])
+                print("  Both optimizer states restored")
         except Exception as e:
             print(f"  Optimizer restore failed: {e}")
 
-    optimizer.param_groups[0]['lr'] = args.lr
+    for pg in opt_hyp.param_groups + opt_euc.param_groups:
+        pg['lr'] = args.lr
     print(f"  Forced optimizer LR to {args.lr}")
 
-    # --- Scheduler ---
+    # --- Scheduler (on Euclidean optimizer) ---
     def lr_lambda(step):
         if step < args.warmup_steps:
             return step / max(1, args.warmup_steps)
         progress = (step - args.warmup_steps) / max(1, args.steps - args.warmup_steps)
         return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt_euc, lr_lambda)
+    sched_hyp = torch.optim.lr_scheduler.LambdaLR(opt_hyp, lr_lambda)
     for _ in range(start_step):
         scheduler.step()
+        sched_hyp.step()
 
     # --- Compile ---
     print("\nCompiling model with torch.compile...")
@@ -246,7 +258,8 @@ def main():
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"  Step {step}: NaN/Inf loss detected, skipping batch")
                 del logits, loss, l1_logits, geom_loss
-                optimizer.zero_grad(set_to_none=True)
+                opt_hyp.zero_grad(set_to_none=True)
+                opt_euc.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 accum_loss = 0.0
                 accum_count = 0
@@ -256,7 +269,8 @@ def main():
         except RuntimeError as e:
             if 'nan' in str(e).lower() or 'inf' in str(e).lower() or 'out of memory' in str(e).lower():
                 print(f"  Step {step}: {str(e)[:80]}, skipping batch")
-                optimizer.zero_grad(set_to_none=True)
+                opt_hyp.zero_grad(set_to_none=True)
+                opt_euc.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 accum_loss = 0.0
                 accum_count = 0
@@ -281,15 +295,19 @@ def main():
 
             if has_nan_grad:
                 print(f"  Step {step+1}: NaN gradient detected, purging and skipping")
-                optimizer.zero_grad(set_to_none=True)
+                opt_hyp.zero_grad(set_to_none=True)
+                opt_euc.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 accum_loss = 0.0
                 accum_count = 0
                 continue
 
-            optimizer.step()
+            opt_hyp.step()
+            opt_euc.step()
             scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            sched_hyp.step()
+            opt_hyp.zero_grad(set_to_none=True)
+            opt_euc.zero_grad(set_to_none=True)
             step += 1
             avg_loss = accum_loss / accum_count
 
@@ -323,15 +341,19 @@ def main():
                 torch.save({
                     'global_step': step,
                     'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
+                    'optimizer_state_dict': {
+                        'opt_hyp': opt_hyp.state_dict(),
+                        'opt_euc': opt_euc.state_dict(),
+                    },
                     'loss': avg_loss,
                     'config': {
-                        'arch': 'H-MICE-L16W1024A16-E12',
+                        'arch': 'H-MICE-v3-L16W1024-E9-interleaved',
                         'vocab_size': vocab_size,
                         'dim': 1024,
+                        'inter_dim': 2048,
                         'n_layers': 16,
                         'n_heads': 16,
-                        'n_experts_per_geom': 4,
+                        'experts': '4E+4H+1S',
                     }
                 }, save_path)
                 print(f"  Saved: {save_path}")

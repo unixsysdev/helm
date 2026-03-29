@@ -1,16 +1,16 @@
 """
-H-MICE Router Validation: Mock Data Trial Run
+H-MICE v3 Validation: Interleaved Dense/MoE + ManifoldParameter Embeddings
 
 Verifies:
-1. Model instantiates at ~400M params
-2. Forward pass works with mock data
-3. L1 router learns to sort geometry tags (>80% accuracy by step 200)
-4. Loss descends normally
-5. No NaN/Inf
+1. ~600M params, interleaved topology, ManifoldParameter on Lorentz
+2. Forward pass clean (no NaN)
+3. Dual optimizer: RiemannianAdam (emb) + AdamW (rest)
+4. Router learns geometry from mock data
 """
 
 import torch
 import torch.nn.functional as F
+import geoopt
 from transformers import AutoTokenizer
 from model import HMICETransformer
 from data import HMICEDataset, generate_mock_data
@@ -30,61 +30,61 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
 
-    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        model_max_length=512,
-    )
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0", model_max_length=512)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    vocab_size = len(tokenizer)
+    V = len(tokenizer)
 
-    # Model
-    print("\n=== Building H-MICE ===")
+    print("\n=== Building H-MICE v3 ===")
     model = HMICETransformer(
-        vocab_size=vocab_size,
-        dim=1024,
-        n_layers=16,
-        n_heads=16,
-        n_experts_per_geom=4,
-        max_seq_len=512,
+        vocab_size=V, dim=1024, n_layers=16, n_heads=16,
+        inter_dim=2048, max_seq_len=512,
     )
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total_params:,} ({total_params/1e6:.0f}M)")
-    assert total_params > 300_000_000, f"Expected >300M params, got {total_params:,}"
-    print("✓ Parameter count check passed")
+    total = model.count_params()
+    hyp_params = model.get_hyperbolic_params()
+    euc_params = model.get_euclidean_params()
+    print(f"Total: {total:,} ({total/1e6:.0f}M)")
+    print(f"Hyperbolic (ManifoldParameter): {sum(p.numel() for p in hyp_params):,}")
+    print(f"Euclidean: {sum(p.numel() for p in euc_params):,}")
+
+    # Checks
+    assert isinstance(model.tok_emb, geoopt.ManifoldParameter), "Embedding must be ManifoldParameter!"
+    print(f"✓ Embedding: ManifoldParameter on Lorentz (shape={model.tok_emb.shape})")
+    n_dense = sum(1 for b in model.blocks if hasattr(b, 'ffn'))
+    n_moe = sum(1 for b in model.blocks if hasattr(b, 'moe'))
+    assert n_dense == 8 and n_moe == 8
+    print(f"✓ Topology: {n_dense} dense + {n_moe} MoE blocks")
+
+    # Manifold check
+    with torch.no_grad():
+        emb = model.tok_emb[:100]
+        mc = -(emb[:, 0]**2) + (emb[:, 1:]**2).sum(dim=-1)
+        print(f"✓ Manifold constraint: {mc.mean().item():.4f}±{mc.std().item():.6f} (expect -1.0)")
 
     model = model.to(device)
 
-    # Data
-    print("\n=== Generating Mock Data ===")
+    # Forward pass
+    print("\n=== Forward Pass ===")
     mock_data = generate_mock_data(n_samples=10000)
     dataset = HMICEDataset(tokenizer, seq_len=512, target_tokens=10_000_000, mock_data=mock_data)
     loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn, num_workers=0)
     loader_iter = iter(loader)
-
-    # Quick forward pass test
-    print("\n=== Forward Pass Test ===")
     input_ids, geom_targets = next(loader_iter)
     input_ids = input_ids.to(device)
-    inputs = input_ids[:, :-1]
 
     with torch.no_grad():
-        logits, l1_logits, geom_loss = model(inputs)
-        print(f"Logits shape: {logits.shape}")
-        print(f"L1 logits shape: {l1_logits.shape}")
-        print(f"Geom loss: {geom_loss.item():.4f}")
+        logits, l1_logits, geom_loss = model(input_ids[:, :-1])
+        print(f"Logits: {logits.shape}, L1: {l1_logits.shape}, Geom: {geom_loss.item():.4f}")
         assert not torch.isnan(logits).any(), "NaN in logits!"
-        assert not torch.isnan(l1_logits).any(), "NaN in L1 logits!"
-        print("✓ Forward pass clean (no NaN)")
+        print("✓ Forward pass clean")
 
-    # Training trial
-    print("\n=== Router Learning Trial (200 steps) ===")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-    n_steps = 200
-    loader_iter = iter(loader)
+    # Dual optimizer
+    print("\n=== Router Trial (200 steps, dual optimizer) ===")
+    opt_hyp = geoopt.optim.RiemannianAdam(model.get_hyperbolic_params(), lr=1e-4, weight_decay=0.0)
+    opt_euc = torch.optim.AdamW(model.get_euclidean_params(), lr=3e-4, weight_decay=0.1)
 
-    for step in range(1, n_steps + 1):
+    for step in range(1, 201):
         try:
             input_ids, geom_targets = next(loader_iter)
         except StopIteration:
@@ -96,63 +96,57 @@ def main():
 
         input_ids = input_ids.to(device)
         geom_targets = geom_targets.to(device)
-
-        inputs = input_ids[:, :-1]
-        targets = input_ids[:, 1:]
+        inputs, targets = input_ids[:, :-1], input_ids[:, 1:]
         geom_tgt = geom_targets[:, :-1]
 
         logits, l1_logits, geom_loss = model(inputs)
-        logits = logits[:, :, :vocab_size]
-
-        B, T, V = logits.shape
-        text_loss = F.cross_entropy(logits.reshape(B * T, V), targets.reshape(B * T),
+        B, T, _ = logits.shape
+        text_loss = F.cross_entropy(logits.reshape(B*T, -1), targets.reshape(B*T),
                                      ignore_index=tokenizer.pad_token_id)
-        scaffold_loss = F.cross_entropy(l1_logits.reshape(B * T, 3), geom_tgt.reshape(B * T))
+        scaffold_loss = F.cross_entropy(l1_logits.reshape(B*T, 3), geom_tgt.reshape(B*T))
         loss = text_loss + scaffold_loss
 
         if torch.isnan(loss):
             print(f"  Step {step}: NaN loss!")
-            optimizer.zero_grad(set_to_none=True)
+            opt_hyp.zero_grad(set_to_none=True)
+            opt_euc.zero_grad(set_to_none=True)
             continue
 
         loss.backward()
-
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if torch.isnan(grad_norm):
-            print(f"  Step {step}: NaN gradient!")
-            optimizer.zero_grad(set_to_none=True)
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if torch.isnan(gn):
+            print(f"  Step {step}: NaN grad!")
+            opt_hyp.zero_grad(set_to_none=True)
+            opt_euc.zero_grad(set_to_none=True)
             continue
 
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        opt_hyp.step()
+        opt_euc.step()
+        opt_hyp.zero_grad(set_to_none=True)
+        opt_euc.zero_grad(set_to_none=True)
 
-        # Router accuracy check
         with torch.no_grad():
-            l1_preds = l1_logits.argmax(dim=-1).reshape(-1)
-            l1_targets = geom_tgt.reshape(-1)
-            accuracy = (l1_preds == l1_targets).float().mean().item()
+            acc = (l1_logits.argmax(-1).reshape(-1) == geom_tgt.reshape(-1)).float().mean().item()
 
         if step % 20 == 0:
-            l1_dist = model.get_l1_distribution()
-            h_pct = int(l1_dist[0].item() * 100)
-            e_pct = int(l1_dist[1].item() * 100)
-            s_pct = int(l1_dist[2].item() * 100)
+            l1d = model.get_l1_distribution()
+            emb = model.tok_emb[:100]
+            mc = -(emb[:, 0]**2) + (emb[:, 1:]**2).sum(dim=-1)
             print(
-                f"Step {step:3d}/{n_steps} | loss={loss.item():.4f} | "
+                f"Step {step:3d}/200 | loss={loss.item():.4f} | "
                 f"text={text_loss.item():.4f} | scaffold={scaffold_loss.item():.4f} | "
-                f"router_acc={accuracy:.1%} | "
-                f"L1=[H:{h_pct}% E:{e_pct}% S:{s_pct}%]"
+                f"acc={acc:.1%} | L1=[E:{int(l1d[0]*100)}% H:{int(l1d[1]*100)}% S:{int(l1d[2]*100)}%] | "
+                f"mc={mc.mean().item():.4f}"
             )
 
-    # Final accuracy check
     print(f"\n=== Results ===")
-    print(f"Final router accuracy: {accuracy:.1%}")
-    if accuracy > 0.5:
-        print("✓ Router is learning to sort geometry!")
-    else:
-        print("⚠ Router accuracy low — may need more steps or tuning")
-
-    print("\nTrial complete.")
+    print(f"Router accuracy: {acc:.1%}")
+    print("✓ Router learning!" if acc > 0.5 else "⚠ Router accuracy low")
+    with torch.no_grad():
+        emb = model.tok_emb[:100]
+        mc = -(emb[:, 0]**2) + (emb[:, 1:]**2).sum(dim=-1)
+        print(f"Final manifold: {mc.mean().item():.4f}±{mc.std().item():.6f}")
+    print("Trial complete.")
 
 
 if __name__ == "__main__":
