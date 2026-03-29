@@ -1,27 +1,31 @@
 """
-H-MICE Data Pipeline: Streaming dataset with offset-mapped geometry tagging.
+H-MICE Data Pipeline
 
-Geometry tags assigned via char-span projection:
-  1. Tokenize with return_offsets_mapping=True
-  2. Regex on raw string → char spans
-  3. Project spans to tokens via offset_mapping
+Two modes:
+  1. ChunkStreamDataset: IterableDataset that polls for binary chunks from the
+     producer (prepare_data_stream.py), loads via memmap, yields 4096-token sequences.
+     When a chunk is exhausted, advances to the next. Waits if chunk not ready.
 
-Tags:
+  2. HMICEDataset: In-memory mock dataset (for test_routing.py validation).
+     Tokenizes + tags on the fly from mock_data.
+
+Geometry tags (offset-mapped projection):
   0 = Euclidean (standard text)
   1 = Spherical (cyclical: dates, trig, modular arithmetic)
   2 = Hyperbolic (hierarchical: <think>, indented code, def/class)
 """
 
-import re
+import os
+import time
 import random
+import numpy as np
 import torch
 from torch.utils.data import IterableDataset
-from datasets import load_dataset, interleave_datasets
 from tokenizer_utils import tag_tokens
 
 
 # =============================================================================
-# Mock Data Generator
+# Mock Data Generator (for validation)
 # =============================================================================
 
 def generate_mock_data(n_samples: int = 10000, seed: int = 42):
@@ -110,16 +114,72 @@ def generate_mock_data(n_samples: int = 10000, seed: int = 42):
 
 
 # =============================================================================
-# Streaming Dataset with Offset-Mapped Geometry Tagging
+# Chunk Stream Dataset (Producer-Consumer IterableDataset)
+# =============================================================================
+
+class ChunkStreamDataset(IterableDataset):
+    """
+    Polls for pre-tokenized binary chunks written by prepare_data_stream.py.
+
+    Each chunk pair (atomic rename from .tmp → .bin):
+      tokens_chunk_{i}.bin  (int32, flat 1-D array)
+      geom_chunk_{i}.bin    (int8, flat 1-D array)
+
+    Yields (input_ids, geom_targets) tensors of shape [seq_len].
+    When current chunk is exhausted, advances. If next chunk is not ready, waits.
+    """
+
+    def __init__(self, data_dir: str, seq_len: int = 4096, start_chunk: int = 0):
+        self.data_dir = data_dir
+        self.seq_len = seq_len
+        self.start_chunk = start_chunk
+
+    def _chunk_exists(self, idx):
+        return os.path.exists(
+            os.path.join(self.data_dir, f"tokens_chunk_{idx}.bin"))
+
+    def __iter__(self):
+        chunk_idx = self.start_chunk
+
+        while True:
+            tok_path = os.path.join(self.data_dir, f"tokens_chunk_{chunk_idx}.bin")
+            geo_path = os.path.join(self.data_dir, f"geom_chunk_{chunk_idx}.bin")
+
+            # --- Poll until chunk appears (atomic rename guarantees complete) ---
+            while not os.path.exists(tok_path):
+                print(f"  [ChunkStream] Waiting for chunk {chunk_idx}...")
+                time.sleep(1)
+
+            # --- Memmap read (zero-copy from NVMe) ---
+            tokens = np.memmap(tok_path, dtype=np.int32, mode='r')
+            geom = np.memmap(geo_path, dtype=np.int8, mode='r')
+
+            num_seqs = len(tokens) // self.seq_len
+
+            # --- Yield sequences from this chunk ---
+            for i in range(num_seqs):
+                start = i * self.seq_len
+                end = start + self.seq_len
+                yield {
+                    'input_ids': torch.from_numpy(
+                        np.array(tokens[start:end]).astype(np.int64)),
+                    'geom_targets': torch.from_numpy(
+                        np.array(geom[start:end]).astype(np.int64)),
+                }
+
+            # --- Free memmap and advance ---
+            del tokens, geom
+            chunk_idx += 1
+
+
+# =============================================================================
+# In-Memory Dataset (for test_routing.py / mock validation)
 # =============================================================================
 
 class HMICEDataset(IterableDataset):
     """
-    Streaming dataset yielding (input_ids, geom_targets) chunks.
-
-    - 60/20/20 mix of CoT / Code / Text
-    - Offset-mapped geometry tagging via regex char-span projection
-    - 512-chunk shuffle buffer
+    In-memory streaming dataset for validation.
+    Tokenizes + tags on the fly from mock_data.
     """
 
     def __init__(self, tokenizer, seq_len: int = 4096, target_tokens: int = 8_400_000_000,
@@ -131,22 +191,6 @@ class HMICEDataset(IterableDataset):
         self.pad_id = tokenizer.pad_token_id or 0
         self.mock_data = mock_data
 
-    def _open_streams(self):
-        if self.mock_data is not None:
-            return iter(self.mock_data)
-
-        cot = load_dataset("open-thoughts/OpenThoughts-114k", split="train", streaming=True)
-        code = load_dataset("HuggingFaceTB/smol-smoltalk", split="train", streaming=True)
-        text = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-
-        mixed = interleave_datasets(
-            [cot, code, text],
-            probabilities=[0.60, 0.20, 0.20],
-            seed=42,
-            stopping_strategy="all_exhausted",
-        )
-        return mixed
-
     def _extract_text(self, example):
         if 'conversations' in example and example['conversations']:
             parts = []
@@ -156,75 +200,56 @@ class HMICEDataset(IterableDataset):
                 if role and content:
                     parts.append(f"<|{role}|>\n{content}")
             return '\n'.join(parts)
-
         for key in ['text', 'content', 'code', 'document']:
             if key in example and example[key]:
                 return str(example[key])
         return ''
 
     def _tokenize_and_tag(self, text: str):
-        """
-        Tokenize with offset mapping and apply geometry tagging.
-        Returns (token_ids, geometry_tags).
-        """
-        enc = self.tokenizer(
-            text,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-            truncation=True,
-            max_length=16384,
-        )
+        enc = self.tokenizer(text, add_special_tokens=False,
+                              return_offsets_mapping=True, truncation=True, max_length=16384)
         ids = enc['input_ids']
-        offsets = enc['offset_mapping']
-        tags = tag_tokens(text, offsets)
+        tags = tag_tokens(text, enc['offset_mapping'])
         return ids, tags
 
     def __iter__(self):
         import random as _rng
         SHUFFLE_BUFFER = 512
-
-        mixed = self._open_streams()
-        token_buffer = []
-        tag_buffer = []
-        chunk_buffer = []
+        mixed = iter(self.mock_data) if self.mock_data else iter([])
+        token_buffer, tag_buffer, chunk_buffer = [], [], []
         total_tokens = 0
 
         for example in mixed:
             if total_tokens >= self.target_tokens:
                 break
-
             text = self._extract_text(example)
             if len(text) < 50:
                 continue
-
             ids, tags = self._tokenize_and_tag(text)
-
             token_buffer.extend(ids)
             tag_buffer.extend(tags)
             token_buffer.append(self.eos_id)
-            tag_buffer.append(0)  # EOS is Euclidean
+            tag_buffer.append(0)
             total_tokens += len(ids) + 1
 
             while len(token_buffer) >= self.seq_len:
-                chunk_ids = token_buffer[:self.seq_len]
-                chunk_tags = tag_buffer[:self.seq_len]
+                chunk_buffer.append((token_buffer[:self.seq_len], tag_buffer[:self.seq_len]))
                 token_buffer = token_buffer[self.seq_len:]
                 tag_buffer = tag_buffer[self.seq_len:]
-                chunk_buffer.append((chunk_ids, chunk_tags))
 
             if len(chunk_buffer) >= SHUFFLE_BUFFER:
                 _rng.shuffle(chunk_buffer)
-                for ids_chunk, tags_chunk in chunk_buffer:
+                for ids_c, tags_c in chunk_buffer:
                     yield {
-                        'input_ids': torch.tensor(ids_chunk, dtype=torch.long),
-                        'geom_targets': torch.tensor(tags_chunk, dtype=torch.long),
+                        'input_ids': torch.tensor(ids_c, dtype=torch.long),
+                        'geom_targets': torch.tensor(tags_c, dtype=torch.long),
                     }
                 chunk_buffer = []
 
         if chunk_buffer:
             _rng.shuffle(chunk_buffer)
-            for ids_chunk, tags_chunk in chunk_buffer:
+            for ids_c, tags_c in chunk_buffer:
                 yield {
-                    'input_ids': torch.tensor(ids_chunk, dtype=torch.long),
-                    'geom_targets': torch.tensor(tags_chunk, dtype=torch.long),
+                    'input_ids': torch.tensor(ids_c, dtype=torch.long),
+                    'geom_targets': torch.tensor(tags_c, dtype=torch.long),
                 }

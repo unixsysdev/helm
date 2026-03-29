@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from model import HMICETransformer
-from data import HMICEDataset, generate_mock_data
+from data import HMICEDataset, ChunkStreamDataset, generate_mock_data
 
 
 def parse_args():
@@ -37,6 +37,8 @@ def parse_args():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--mock", action="store_true", help="Use mock data for trial run")
     p.add_argument("--mock_steps", type=int, default=500, help="Steps for mock trial")
+    p.add_argument("--data_dir", type=str, default="/data/h_mice_chunks",
+                   help="Directory of pre-tokenized chunks from prepare_data_stream.py")
     # Bimodal loss params
     p.add_argument("--scaffold_steps", type=int, default=2000)
     p.add_argument("--scaffold_alpha", type=float, default=1.0, help="Scaffold loss weight")
@@ -94,30 +96,36 @@ def main():
     # --- Data ---
     from tokenizer_utils import get_tokenizer
 
-    if args.mock:
-        print("\nGenerating mock data for trial run...")
-        mock_data = generate_mock_data(n_samples=50000)
-    else:
-        print("\nInitializing streaming 60/20/20 mix (CoT / Code / Text)...")
-        mock_data = None
-
-    # --- Tokenizer (32K baseline) ---
+    # --- Tokenizer (32K Mistral baseline) ---
     print("\nLoading 32K tokenizer...")
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.vocab_size
     print(f"  Vocab: {vocab_size}")
 
     # --- Dataset ---
+    use_chunks = not args.mock and os.path.exists(args.data_dir)
     if args.mock:
+        print("\nGenerating mock data for trial run...")
+        mock_data = generate_mock_data(n_samples=50000)
         target_tokens = args.mock_steps * args.batch_size * args.grad_accum * args.seq_len
         dataset = HMICEDataset(tokenizer, args.seq_len, target_tokens, mock_data=mock_data)
+        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn,
+                            num_workers=0, pin_memory=True)
+        loader_iter = iter(loader)
+    elif use_chunks:
+        print(f"\nUsing ChunkStream from: {args.data_dir}")
+        dataset = ChunkStreamDataset(args.data_dir, seq_len=args.seq_len)
+        # num_workers=0: producer does the I/O, consumer just reads NVMe via DMA
+        loader = DataLoader(dataset, batch_size=args.batch_size,
+                            collate_fn=collate_fn, num_workers=0, pin_memory=True)
+        loader_iter = iter(loader)
     else:
+        print(f"\n⚠ No chunks in {args.data_dir} — falling back to HF streaming")
         target_tokens = args.steps * args.batch_size * args.grad_accum * args.seq_len
         dataset = HMICEDataset(tokenizer, args.seq_len, target_tokens)
-
-    loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn,
-                        num_workers=0, pin_memory=True)
-    loader_iter = iter(loader)
+        loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn,
+                            num_workers=0, pin_memory=True)
+        loader_iter = iter(loader)
     print("  Data ready")
 
     # --- Model ---
@@ -220,6 +228,8 @@ def main():
                                     num_workers=0, pin_memory=True)
                 loader_iter = iter(loader)
                 continue
+            # ChunkStreamDataset never exhausts (infinite poll loop)
+            # HF streaming just ends
             break
 
         input_ids = input_ids.to(device)
