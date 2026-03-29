@@ -1,11 +1,15 @@
 """
-H-MICE Data Pipeline: Streaming dataset with geometric metadata heuristics.
+H-MICE Data Pipeline: Streaming dataset with offset-mapped geometry tagging.
 
-Yields (input_ids, labels, geom_targets) where geom_targets is a per-token
-geometry tag:
+Geometry tags assigned via char-span projection:
+  1. Tokenize with return_offsets_mapping=True
+  2. Regex on raw string → char spans
+  3. Project spans to tokens via offset_mapping
+
+Tags:
   0 = Euclidean (standard text)
-  1 = Spherical (cyclical patterns: %, datetime, sin, cos)
-  2 = Hyperbolic (hierarchical: <think> tags, indented code)
+  1 = Spherical (cyclical: dates, trig, modular arithmetic)
+  2 = Hyperbolic (hierarchical: <think>, indented code, def/class)
 """
 
 import re
@@ -13,92 +17,11 @@ import random
 import torch
 from torch.utils.data import IterableDataset
 from datasets import load_dataset, interleave_datasets
+from tokenizer_utils import tag_tokens
 
 
 # =============================================================================
-# Geometry Heuristic Tagger
-# =============================================================================
-
-# Regex patterns for spherical detection
-SPHERICAL_PATTERNS = re.compile(
-    r'\b(sin|cos|tan|atan|asin|acos|datetime|timedelta|strftime|'
-    r'modulo|periodic|cycle|frequency|rotation|angle|degree|radian|'
-    r'Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|'
-    r'January|February|March|April|May|June|July|August|September|'
-    r'October|November|December)\b|%[dfsYmHMS]',
-    re.IGNORECASE
-)
-
-# Patterns for hyperbolic detection
-HYPERBOLIC_INDENT = re.compile(r'^(\s{4,}|\t+)')  # 4+ spaces or tabs
-THINK_OPEN = re.compile(r'<think>', re.IGNORECASE)
-THINK_CLOSE = re.compile(r'</think>', re.IGNORECASE)
-
-
-def tag_text_geometry(text: str) -> list:
-    """
-    Tag each line of text with a geometry heuristic.
-    Returns list of (line, tag) tuples.
-
-    Tag 0: Euclidean (default)
-    Tag 1: Spherical (cyclical patterns)
-    Tag 2: Hyperbolic (hierarchical/nested)
-    """
-    lines = text.split('\n')
-    tags = []
-    in_think = False
-
-    for line in lines:
-        if THINK_OPEN.search(line):
-            in_think = True
-
-        if in_think:
-            tags.append((line, 2))  # Hyperbolic
-        elif HYPERBOLIC_INDENT.match(line):
-            # Indented code (def, class, nested logic)
-            tags.append((line, 2))  # Hyperbolic
-        elif SPHERICAL_PATTERNS.search(line):
-            tags.append((line, 1))  # Spherical
-        else:
-            tags.append((line, 0))  # Euclidean
-
-        if THINK_CLOSE.search(line):
-            in_think = False
-
-    return tags
-
-
-def tag_tokens_geometry(text: str, tokenizer, token_ids: list) -> list:
-    """
-    Assign geometry tags to token IDs based on text heuristics.
-    Maps line-level tags to token-level tags using character offsets.
-    """
-    tagged_lines = tag_text_geometry(text)
-
-    # Build character-to-tag mapping
-    char_tags = []
-    for line, tag in tagged_lines:
-        char_tags.extend([tag] * (len(line) + 1))  # +1 for newline
-
-    # For each token, find its approximate character position
-    # Simple heuristic: distribute tags proportionally across tokens
-    n_tokens = len(token_ids)
-    n_chars = len(char_tags)
-
-    if n_chars == 0 or n_tokens == 0:
-        return [0] * n_tokens
-
-    token_tags = []
-    for i in range(n_tokens):
-        char_pos = int(i * n_chars / n_tokens)
-        char_pos = min(char_pos, n_chars - 1)
-        token_tags.append(char_tags[char_pos])
-
-    return token_tags
-
-
-# =============================================================================
-# Mock Data Generator (for trial runs)
+# Mock Data Generator
 # =============================================================================
 
 def generate_mock_data(n_samples: int = 10000, seed: int = 42):
@@ -106,7 +29,6 @@ def generate_mock_data(n_samples: int = 10000, seed: int = 42):
     rng = random.Random(seed)
     samples = []
 
-    # Templates for each geometry
     hyp_templates = [
         "<think>\nLet me work through this step by step.\n"
         "First, we need to consider the base case.\n"
@@ -144,9 +66,8 @@ def generate_mock_data(n_samples: int = 10000, seed: int = 42):
 
     sph_templates = [
         "The current datetime is 2024-01-15 14:30:00 UTC.\n"
-        "Converting to strftime format: %Y-%m-%d %H:%M:%S\n"
-        "The day of the week is Monday.\n"
-        "Next rotation occurs on Tuesday at cos(2*pi*t/T).\n",
+        "Converting timezone offset. The day is Monday.\n"
+        "Next rotation on Tuesday at cos(2*pi*t/T).\n",
 
         "import math\n"
         "angle = math.radians(45)\n"
@@ -155,7 +76,7 @@ def generate_mock_data(n_samples: int = 10000, seed: int = 42):
         "rotation_matrix = [[cos(theta), -sin(theta)],\n"
         "                    [sin(theta), cos(theta)]]\n",
 
-        "Schedule: Monday through Friday, 9am to 5pm.\n"
+        "Schedule: Monday through Friday.\n"
         "The cycle repeats every 7 days.\n"
         "January, February, March — quarterly rotation.\n"
         "Frequency: 60Hz, period = 1/frequency seconds.\n",
@@ -189,15 +110,15 @@ def generate_mock_data(n_samples: int = 10000, seed: int = 42):
 
 
 # =============================================================================
-# Streaming Dataset with Geometric Metadata
+# Streaming Dataset with Offset-Mapped Geometry Tagging
 # =============================================================================
 
 class HMICEDataset(IterableDataset):
     """
-    Streaming dataset that yields (input_ids, geom_targets) chunks.
+    Streaming dataset yielding (input_ids, geom_targets) chunks.
 
     - 60/20/20 mix of CoT / Code / Text
-    - Heuristic geometry tagging per token
+    - Offset-mapped geometry tagging via regex char-span projection
     - 512-chunk shuffle buffer
     """
 
@@ -207,6 +128,7 @@ class HMICEDataset(IterableDataset):
         self.seq_len = seq_len
         self.target_tokens = target_tokens
         self.eos_id = tokenizer.eos_token_id or 2
+        self.pad_id = tokenizer.pad_token_id or 0
         self.mock_data = mock_data
 
     def _open_streams(self):
@@ -240,6 +162,23 @@ class HMICEDataset(IterableDataset):
                 return str(example[key])
         return ''
 
+    def _tokenize_and_tag(self, text: str):
+        """
+        Tokenize with offset mapping and apply geometry tagging.
+        Returns (token_ids, geometry_tags).
+        """
+        enc = self.tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=16384,
+        )
+        ids = enc['input_ids']
+        offsets = enc['offset_mapping']
+        tags = tag_tokens(text, offsets)
+        return ids, tags
+
     def __iter__(self):
         import random as _rng
         SHUFFLE_BUFFER = 512
@@ -258,11 +197,7 @@ class HMICEDataset(IterableDataset):
             if len(text) < 50:
                 continue
 
-            text_trunc = text[:16384]
-            ids = self.tokenizer.encode(text_trunc, add_special_tokens=False)
-
-            # Get per-token geometry tags
-            tags = tag_tokens_geometry(text_trunc, self.tokenizer, ids)
+            ids, tags = self._tokenize_and_tag(text)
 
             token_buffer.extend(ids)
             tag_buffer.extend(tags)

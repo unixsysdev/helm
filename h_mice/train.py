@@ -16,7 +16,6 @@ import argparse
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 from model import HMICETransformer
 from data import HMICEDataset, generate_mock_data
@@ -92,25 +91,29 @@ def main():
     print(f"  geom_lambda={args.geom_lambda}")
     print(f"  mock={'YES' if args.mock else 'NO'}")
 
-    # --- Tokenizer ---
-    print("\nLoading TinyLlama 32K tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        model_max_length=args.seq_len,
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    vocab_size = len(tokenizer)
-    print(f"  Vocab: {vocab_size}")
+    # --- Data (need texts first to train tokenizer) ---
+    from tokenizer_utils import get_tokenizer
 
-    # --- Data ---
     if args.mock:
         print("\nGenerating mock data for trial run...")
         mock_data = generate_mock_data(n_samples=50000)
+        train_texts = [s['text'] for s in mock_data]
+    else:
+        print("\nInitializing streaming 60/20/20 mix (CoT / Code / Text)...")
+        mock_data = None
+        train_texts = None  # Will use cached tokenizer
+
+    # --- Tokenizer (8192 BPE) ---
+    print("\nLoading/training 8192-BPE tokenizer...")
+    tokenizer = get_tokenizer(train_texts=train_texts)
+    vocab_size = tokenizer.vocab_size
+    print(f"  Vocab: {vocab_size}")
+
+    # --- Dataset ---
+    if args.mock:
         target_tokens = args.mock_steps * args.batch_size * args.grad_accum * args.seq_len
         dataset = HMICEDataset(tokenizer, args.seq_len, target_tokens, mock_data=mock_data)
     else:
-        print("\nInitializing streaming 60/20/20 mix (CoT / Code / Text)...")
         target_tokens = args.steps * args.batch_size * args.grad_accum * args.seq_len
         dataset = HMICEDataset(tokenizer, args.seq_len, target_tokens)
 
