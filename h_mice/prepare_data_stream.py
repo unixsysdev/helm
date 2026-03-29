@@ -50,15 +50,13 @@ def stream_dataset(split_ratios=None):
         return {"text": "\n".join(parts)}
     cot = cot.map(_format_cot)
 
-    # Code (20%)
-    code = load_dataset("bigcode/starcoderdata", data_dir="python",
+    # Python Code (20%) — educational Python from SmolLM-Corpus
+    code = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu",
                          split="train", streaming=True)
-    code = code.map(lambda x: {"text": x.get("content", "")})
 
-    # General text (20%)
-    text = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+    # General Text (20%) — knowledge from SmolLM-Corpus
+    text = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2",
                          split="train", streaming=True)
-    text = text.map(lambda x: {"text": x.get("text", "")})
 
     combined = interleave_datasets(
         [cot, code, text],
