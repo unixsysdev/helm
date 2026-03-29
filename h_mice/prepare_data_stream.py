@@ -29,45 +29,70 @@ def stream_dataset(split_ratios=None):
     Stream the 60/20/20 mix: CoT reasoning / Code / General text.
     Yields raw text strings indefinitely.
     """
-    from datasets import load_dataset, interleave_datasets
+    from datasets import load_dataset
 
     if split_ratios is None:
         split_ratios = [0.6, 0.2, 0.2]
 
+    import random as _rng
     print("  Initializing streaming datasets...")
 
     # CoT / Deep Reasoning (60%) — native multi-step traces
     cot = load_dataset("open-thoughts/OpenThoughts-114k", split="train", streaming=True)
-    def _format_cot(x):
-        parts = []
-        for turn in (x.get("conversations") or []):
-            role = turn.get("from", turn.get("role", ""))
-            content = turn.get("value", turn.get("content", ""))
-            if role == "human":
-                parts.append(content)
-            elif role in ("gpt", "assistant") and content:
-                parts.append(f"<think>\n{content}\n</think>")
-        return {"text": "\n".join(parts)}
-    cot = cot.map(_format_cot)
+    print("    ✓ OpenThoughts-114k")
 
     # Python Code (20%) — educational Python from SmolLM-Corpus
     code = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu",
                          split="train", streaming=True)
+    print("    ✓ smollm-corpus/python-edu")
 
     # General Text (20%) — knowledge from SmolLM-Corpus
     text = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2",
                          split="train", streaming=True)
+    print("    ✓ smollm-corpus/cosmopedia-v2")
 
-    combined = interleave_datasets(
-        [cot, code, text],
-        probabilities=split_ratios,
-        stopping_strategy="all_exhausted",
-    )
+    # Manual round-robin with 60/20/20 weights (avoid slow interleave_datasets)
+    iters = [iter(cot), iter(code), iter(text)]
+    weights = split_ratios  # [0.6, 0.2, 0.2]
+    exhausted = [False, False, False]
 
-    for sample in combined:
-        t = sample.get("text", "")
-        if t and len(t) > 50:
-            yield t
+    def _extract(example, source_idx):
+        """Extract text from dataset sample based on source."""
+        if source_idx == 0:  # OpenThoughts — format conversations
+            parts = []
+            for turn in (example.get("conversations") or []):
+                role = turn.get("from", turn.get("role", ""))
+                content = turn.get("value", turn.get("content", ""))
+                if role == "human":
+                    parts.append(content)
+                elif role in ("gpt", "assistant") and content:
+                    parts.append(f"<think>\n{content}\n</think>")
+            return "\n".join(parts)
+        else:  # smollm-corpus — text field
+            return example.get("text", "")
+
+    while not all(exhausted):
+        # Weighted random pick
+        r = _rng.random()
+        if r < weights[0] and not exhausted[0]:
+            src = 0
+        elif r < weights[0] + weights[1] and not exhausted[1]:
+            src = 1
+        else:
+            src = 2
+        if exhausted[src]:
+            # Fall back to any non-exhausted source
+            src = next((i for i in range(3) if not exhausted[i]), None)
+            if src is None:
+                break
+
+        try:
+            sample = next(iters[src])
+            t = _extract(sample, src)
+            if t and len(t) > 50:
+                yield t
+        except StopIteration:
+            exhausted[src] = True
 
 
 def stream_mock_data():
