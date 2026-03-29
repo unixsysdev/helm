@@ -138,6 +138,9 @@ class ChunkStreamDataset(IterableDataset):
         return os.path.exists(
             os.path.join(self.data_dir, f"tokens_chunk_{idx}.bin"))
 
+    def _producer_done(self):
+        return os.path.exists(os.path.join(self.data_dir, "DONE"))
+
     def __iter__(self):
         chunk_idx = self.start_chunk
 
@@ -145,9 +148,10 @@ class ChunkStreamDataset(IterableDataset):
             tok_path = os.path.join(self.data_dir, f"tokens_chunk_{chunk_idx}.bin")
             geo_path = os.path.join(self.data_dir, f"geom_chunk_{chunk_idx}.bin")
 
-            # --- Poll until chunk appears (atomic rename guarantees complete) ---
+            # --- Poll until chunk appears or producer signals DONE ---
             while not os.path.exists(tok_path):
-                print(f"  [ChunkStream] Waiting for chunk {chunk_idx}...")
+                if self._producer_done():
+                    return  # No more chunks coming
                 time.sleep(1)
 
             # --- Memmap read (zero-copy from NVMe) ---

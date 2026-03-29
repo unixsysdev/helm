@@ -172,6 +172,10 @@ def produce_chunks(out_dir: str, chunk_tokens: int, seq_len: int = 4096,
         chunk_idx += 1
 
     elapsed = time.time() - t_start
+    # Signal consumer: no more chunks coming
+    done_path = os.path.join(out_dir, "DONE")
+    with open(done_path, 'w') as f:
+        f.write(f"{chunk_idx}\n")
     print(f"\n=== Producer Done ===")
     print(f"  {chunk_idx} chunks, {total_tokens:,} tokens in {elapsed:.1f}s")
 
