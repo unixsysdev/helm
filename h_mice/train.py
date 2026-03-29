@@ -160,7 +160,7 @@ def main():
     print(f"  Euclidean params: {sum(p.numel() for p in euc_params):,}")
 
     # RiemannianAdam for ManifoldParameter (embeddings on Lorentz)
-    opt_hyp = geoopt.optim.RiemannianAdam(hyp_params, lr=args.lr, weight_decay=0.0)
+    opt_hyp = geoopt.optim.RiemannianAdam(hyp_params, lr=args.lr, weight_decay=0.0, stabilize=10)
     # AdamW for everything else
     opt_euc = torch.optim.AdamW(euc_params, lr=args.lr, betas=(0.9, 0.95),
                                  weight_decay=0.1, fused=True)

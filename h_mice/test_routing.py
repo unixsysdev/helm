@@ -84,8 +84,8 @@ def main():
 
     # --- Training Trial ---
     print("\n=== Router Trial (200 steps) ===")
-    opt_hyp = geoopt.optim.RiemannianAdam(model.get_hyperbolic_params(), lr=1e-4, weight_decay=0.0)
-    opt_euc = torch.optim.AdamW(model.get_euclidean_params(), lr=3e-4, weight_decay=0.1)
+    opt_hyp = geoopt.optim.RiemannianAdam(model.get_hyperbolic_params(), lr=1e-5, weight_decay=0.0, stabilize=10)
+    opt_euc = torch.optim.AdamW(model.get_euclidean_params(), lr=1e-4, weight_decay=0.1)
 
     for step in range(1, 201):
         try:
@@ -116,7 +116,7 @@ def main():
             continue
 
         loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         if torch.isnan(gn):
             opt_hyp.zero_grad(set_to_none=True)
             opt_euc.zero_grad(set_to_none=True)

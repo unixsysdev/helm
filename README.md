@@ -1,33 +1,60 @@
 # H-MICE: Hierarchical Mixture of Curvature Experts
 
-A **~600M parameter** sparse transformer decoder using a **Log-Euclidean Tangent Space** architecture with **interleaved Dense/MoE blocks** and **9 geometry-specialized experts**.
+A **~550M parameter** sparse transformer decoder using a **Log-Euclidean Tangent Sandwich** architecture with **curved residual stream**, **interleaved Dense/MoE blocks**, and **9 geometry-specialized experts**.
 
 ## Architecture
 
 ```
 Token → ManifoldParameter Embedding (ON Lorentz, 8192×1025)
   │
-  logmap₀ (single projection to flat)
+  ▼  CURVED Residual Stream (D+1 dim, Lorentz manifold)
   │
-  ▼  Flat Euclidean Residual Stream (1024-dim)
-  │
-  ├── Block 1  [Dense]  Attn + SwiGLU FFN (1024→2048→1024)
-  ├── Block 2  [MoE]    Attn + H-MICE Router → 9 Experts
+  ├── Block 1  [Dense]  log₀→Norm→SpatialAttn→Pad→NormPost→exp₀
+  │                     log₀→Norm→SwiGLU→Pad→NormPost→exp₀
+  ├── Block 2  [MoE]   log₀→Norm→SpatialAttn→Pad→NormPost→exp₀
+  │                     log₀→Norm→MoE(9 experts)→Pad→NormPost→exp₀
   ├── Block 3  [Dense]
   ├── Block 4  [MoE]
   ├── ...
   ├── Block 15 [Dense]
   └── Block 16 [MoE]
   │
-  RMSNorm → LM Head (1024→8192) → Logits
+  log₀ → RMSNorm(spatial) → LM Head (1024→8192) → Logits
 ```
+
+### The Tangent Sandwich (Per Sub-Layer)
+
+```
+x_manifold ──→ logmap₀ ──→ v_tangent (D+1)
+                              │
+                          RMSNorm(D+1)
+                              │
+                          v[..., 1:]  ← strip time (spatial-only, D-dim)
+                              │
+                    ┌─────────┴─────────┐
+                    │  Flat Compute:     │
+                    │  SpatialAttn(FA2)  │
+                    │  or SwiGLU FFN     │
+                    │  or MoE Experts    │
+                    └─────────┬─────────┘
+                              │
+                          F.pad(0, D+1)  ← reconstruct time=0
+                              │
+                          v + expert_out  ← tangent residual add
+                              │
+                          RMSNorm(D+1)  ← POST-ADDITION norm
+                              │
+                    x_new = expmap₀ ──→ back on manifold
+```
+
+**Key insight**: The post-addition RMSNorm before `expmap₀` prevents tangent magnitude blowup through 16 layers while remaining fully learnable (no destructive clamping).
 
 ### Interleaved Block Topology
 
 | Block Type | Layers | Contents |
 |---|---|---|
-| **Dense** (odd: 1,3,5...) | 8 blocks | Attn + SwiGLU FFN (1024→2048→1024) |
-| **MoE** (even: 2,4,6...) | 8 blocks | Attn + H-MICE 2-tier Router → 9 Experts |
+| **Dense** (even idx: 0,2,4...) | 8 blocks | SpatialAttn + SwiGLU FFN |
+| **MoE** (odd idx: 1,3,5...) | 8 blocks | SpatialAttn + H-MICE 2-tier Router → 9 Experts |
 
 ### The 9-Expert Array (Per MoE Block)
 
@@ -46,25 +73,37 @@ L1 Router → 3 logits [Euclidean, Hyperbolic, Spherical]
 | Expert | Geometry | Curvature | Operation |
 |---|---|---|---|
 | E1–E4 | Euclidean | — | Pure flat SwiGLU FFN |
-| H1 | Hyperbolic | k=0.2 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
-| H2 | Hyperbolic | k=0.5 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
-| H3 | Hyperbolic | k=1.0 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
-| H4 | Hyperbolic | k=2.0 (fixed) | SwiGLU + exp₀ → Lorentz dist² |
+| H1 | Hyperbolic | k=0.2 (fixed) | SwiGLU + exp₀→Lorentz dist² |
+| H2 | Hyperbolic | k=0.5 (fixed) | SwiGLU + exp₀→Lorentz dist² |
+| H3 | Hyperbolic | k=1.0 (fixed) | SwiGLU + exp₀→Lorentz dist² |
+| H4 | Hyperbolic | k=2.0 (fixed) | SwiGLU + exp₀→Lorentz dist² |
 | S1 | Spherical | unit sphere | 1024→64→SwiGLU→projx→64→1024 |
+
+### Numerical Stability: Pre-Norm + Zero-Init
+
+| Technique | Purpose |
+|---|---|
+| **Zero-init `wo`** (attention output) | Step-0: `attn_out = 0` → identity pass-through |
+| **Zero-init `w2`** (FFN/expert down-proj) | Step-0: `expert_out = 0` → identity pass-through |
+| **Pre-addition RMSNorm** (D+1 tangent) | Normalize tangent before expert computation |
+| **Post-addition RMSNorm** (D+1 tangent) | Bound tangent magnitude before `expmap₀` |
+| **`stabilize=10`** (RiemannianAdam) | Re-project embeddings onto Lorentz every 10 steps |
+
+At Step 0: `expmap₀(logmap₀(x) + 0) = x` → perfect identity through all 16 layers. No NaN, no exponential blowup.
 
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Embeddings | `ManifoldParameter` on Lorentz | Exponential volume for hierarchical data |
-| Entry | Single `logmap₀` at start | No NaN compounding from chained manifold ops |
-| Residual stream | Flat Euclidean | 130k tok/s throughput, numerical stability |
-| Experts | Standard `nn.Linear` SwiGLU | Stable, fast, `torch.compile` friendly |
-| Hyperbolic curvatures | **Fixed** k=[0.2, 0.5, 1.0, 2.0] | Prevents optimizer from collapsing manifold |
-| Spherical expert | 64D bottleneck | Avoids hollow sphere (curse of dimensionality) |
+| Residual stream | **Curved (Lorentz D+1)** | True exponential volume through all layers |
+| Embeddings | `ManifoldParameter` on Lorentz | Maintained by RiemannianAdam |
+| Attention | Spatial-only FA2 (`is_causal=True`) | Time=0 in tangent space → skip wasted compute |
+| Experts | `nn.Linear` SwiGLU (zero-init'd) | Stable, fast, `torch.compile` friendly |
+| Curvatures | **Fixed** k=[0.2, 0.5, 1.0, 2.0] | Prevents optimizer from collapsing manifold |
+| Spherical expert | 64D bottleneck + ε-safe projx | Avoids hollow sphere + zero-vector NaN |
 | Geometric loss | `p_selected × d²` | Backprop whip: router self-corrects |
-| Vocab | 8192 BPE | VRAM conserved for MoE experts |
-| Optimizer | Dual: RiemannianAdam(emb) + AdamW(rest) | ManifoldParam needs Riemannian updates |
+| Vocab | 8192 BPE (custom trained) | VRAM conserved for MoE experts |
+| Optimizer | Dual: RiemannianAdam + AdamW | ManifoldParam needs Riemannian updates |
 
 ### Sizing
 
@@ -72,11 +111,18 @@ L1 Router → 3 logits [Euclidean, Hyperbolic, Spherical]
 |---|---|---|
 | Embedding (8192 × 1025, ManifoldParameter) | 8.4M | 8.4M |
 | LM Head (1024 × 8192) | 8.4M | 8.4M |
-| 8 Dense Blocks (Attn + FFN) | ~84M | ~84M |
-| 8 MoE Blocks (Attn + 9 Experts) | ~490M | ~94M |
-| **Total** | **~590M** | **~195M** |
+| 8 Dense Blocks (Attn + FFN + 4×RMSNorm) | ~84M | ~84M |
+| 8 MoE Blocks (Attn + 9 Experts + 4×RMSNorm) | ~490M | ~94M |
+| **Total** | **~550M** | **~195M** |
 
 ## Training: Bimodal Loss
+
+### Dual Optimizer Protocol
+
+```python
+opt_manifold = geoopt.optim.RiemannianAdam(manifold_params, lr=1e-5, stabilize=10)
+opt_euclidean = torch.optim.AdamW(euclidean_params, lr=1e-4, weight_decay=0.1)
+```
 
 ### Phase 1: Supervised Scaffolding (Steps 0–2000)
 ```
@@ -85,7 +131,7 @@ L_total = L_text + α × CrossEntropy(L1_logits, geom_targets)
 
 Geometry tags assigned via **offset-mapped regex projection**:
 1. Tokenize with `return_offsets_mapping=True`
-2. Regex on raw string: `<think>` blocks → Hyperbolic, datetime/trig → Spherical
+2. Regex on raw string: `<think>` / `def` / `class` → Hyperbolic, `cos`/dates → Spherical
 3. Project char spans to token spans via offset mapping
 
 ### Phase 2: Geometric Distortion (Steps 2001+)
@@ -94,20 +140,35 @@ L_total = L_text + λ × Σ p_selected(x) · d²_M(0, E(x))
 ```
 **Backprop whip**: router self-corrects via gradient from manifold distance.
 
+## Telemetry
+
+```
+Step 100: loss=0.150 text=0.140 scaf=0.010 gn=2.0 acc=99% mc=-1.0000 L1=[E:32 H:32 S:34]
+```
+
+| Metric | Meaning |
+|---|---|
+| `mc` | Manifold constraint: -(x₀²) + Σxᵢ² (expect -1.0) |
+| `L1=[E:32 H:32 S:34]` | Geometry class EMA distribution (zero-sync) |
+| `acc` | Router scaffold accuracy (Phase 1) |
+| `gn` | Gradient norm (post-clip) |
+
 ## Quick Start
 
 ```bash
-# Trial run (validates router + manifold embedding)
+# Trial run (validates router + manifold + FA2)
 cd h_mice && python test_routing.py
 
-# Full training
+# Full training (H200)
 python h_mice/train.py --batch_size 16 --grad_accum 8 --lr 3e-4 \
   --save_dir /tmp/checkpoints/h_mice --seq_len 4096
 ```
 
 ## Safety
 
-- Triple NaN guard: forward → backward → gradient scan
-- Interleaved dense blocks stabilize manifold-free residual flow
-- Fixed curvatures prevent optimizer collapse
-- `torch.cuda.empty_cache()` on OOM recovery
+- **Zero-init identity**: wo + w2 = 0 → step-0 pass-through (no random blowup)
+- **Post-addition RMSNorm**: bounded tangent magnitude before expmap₀
+- **Triple NaN guard**: forward → backward → gradient scan
+- **RiemannianAdam stabilize=10**: re-project embeddings onto hyperboloid
+- **Fixed curvatures**: prevents optimizer-driven manifold collapse
+- **`torch.cuda.empty_cache()`** on OOM recovery
