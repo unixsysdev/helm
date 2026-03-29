@@ -332,7 +332,13 @@ def main():
         if ckpt_path:
             print(f"\nResuming from: {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            # Strip torch.compile's '_orig_mod.' prefix from state dict keys
+            state_dict = ckpt['model_state_dict']
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            loaded_keys = model.load_state_dict(state_dict, strict=False)
+            print(f"  Loaded {len(state_dict) - len(loaded_keys.unexpected_keys)}/{len(state_dict)} keys")
+            if loaded_keys.missing_keys:
+                print(f"  Missing: {loaded_keys.missing_keys[:3]}...")
             start_step = ckpt.get('global_step', 0)
             _resume_optimizer_state = ckpt.get('optimizer_state_dict', None)
             print(f"  Restored step {start_step}")
@@ -356,10 +362,14 @@ def main():
     ], lr=args.lr)
     if _resume_optimizer_state:
         try:
+            # Inject missing 'step' key (geoopt saves without it, newer PyTorch expects it)
+            for k, v in _resume_optimizer_state.get("state", {}).items():
+                if "step" not in v:
+                    v["step"] = torch.tensor(float(start_step))
             optimizer.load_state_dict(_resume_optimizer_state)
-            print("  Optimizer state restored")
-        except:
-            print("  Optimizer state restore failed, using fresh")
+            print("  Optimizer state restored (with momentum)")
+        except Exception as e:
+            print(f"  Optimizer state restore failed: {e}, using fresh")
 
     # Force LR from args (override checkpoint LR)
     for pg in optimizer.param_groups:
@@ -429,11 +439,25 @@ def main():
                 ignore_index=tokenizer.pad_token_id,
             )
             loss = loss / args.grad_accum
+
+            # Guard 1: NaN in forward pass — skip BEFORE backward
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"  Step {step}: NaN/Inf loss detected, skipping batch")
+                del logits, loss
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                accum_loss = 0.0
+                accum_count = 0
+                continue
+
             loss.backward()
         except RuntimeError as e:
-            if 'nan' in str(e).lower() or 'inf' in str(e).lower():
-                print(f"  Step {step}: NaN/Inf detected, skipping batch")
-                optimizer.zero_grad()
+            if 'nan' in str(e).lower() or 'inf' in str(e).lower() or 'out of memory' in str(e).lower():
+                print(f"  Step {step}: {str(e)[:80]}, skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                accum_loss = 0.0
+                accum_count = 0
                 continue
             raise
 
@@ -445,9 +469,18 @@ def main():
         if accum_count >= args.grad_accum:
             # Clip gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            # Guard: NaN in gradients (backward pass explosion)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"  Step {step+1}: NaN gradient detected, purging and skipping")
+                optimizer.zero_grad(set_to_none=True)
+                accum_loss = 0.0
+                accum_count = 0
+                continue
+
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             step += 1
             avg_loss = accum_loss / accum_count
 
